@@ -65,7 +65,7 @@ Forecast * WeatherAPI::GetForecast(size_t maxRequest) {
     size_t Cnt = data["cnt"].as<size_t>();
     Cnt = maxRequest < Cnt ? maxRequest : Cnt;
     //libero la memoria precedentemente utilizzata
-    if(this->forecsts != nullptr)
+    if(this->forecsts != NULL)
         free(this->forecsts);
     //creo gli oggetti
     this->forecsts = (Forecast *) malloc(sizeof(Forecast) * Cnt);
