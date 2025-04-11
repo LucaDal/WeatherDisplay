@@ -18,7 +18,7 @@ class Forecast{
         Forecast(JsonDocument data);
         Forecast(const unsigned char * icon, double temp, double percivedTemp, int humidity);
     private:
-        const uint8_t * getIconPointer(const char iconName);
+        const uint8_t * getIconPointer(const char* iconName);
 };
 
 #endif

@@ -262,10 +262,16 @@ void drawCo2Values(Point point, uint16_t width, uint16_t height) {
     drawImage(FACE_BAD, badX, y + offsetFaceState, 16);
     return;
   }
-  char buffer[10];
+  char buffer[6];
   int co2 = airSensor.getCO2();
   uint8_t retHeight;
   sprintf(buffer, "%05d\n", co2);
+  //metto gli spazi al posto dei leading zeros
+  for(size_t i = 0; i < strlen(buffer); i++){
+    if(buffer[i] == '0')
+      buffer[i] = ' ';
+  }
+    
   writePartial(buffer, x, y, 2, &retHeight, false);
   y += retHeight + 3;
   co2 = co2 > range ? range : co2;
@@ -331,7 +337,7 @@ void getForecast(){
   //altrimenti copio il vecchio elemento nella prima posizione;
   int positionOldArray = 0;
   for(size_t i = 0; i < size; i++){
-    if(temp[i].timeStamp.getUnix() + (3600*3) > currTime){
+    if((temp[i].timeStamp.getUnix() + (3600*3)) > currTime){
       //shifto in avanti
       for(size_t j = size - 1; j >= 1; j--){
         forecasts[j] = forecasts[j-1] ;
@@ -346,7 +352,7 @@ void getForecast(){
 
 void UpdateForecast() {
 
-  if (forecasts == NULL || timeClient.getEpochTime() > forecasts[0].timeStamp.getUnix()+(3600*3)) {
+  if (forecasts == NULL || timeClient.getEpochTime() > (forecasts[0].timeStamp.getUnix()+(3600*3))) {
     //aggiorno dati ogni 9 ore: 2 *
     if (forecasts == NULL || currForecastIdx >= 3) {
       if (debug) {
@@ -415,6 +421,7 @@ void setup() {
   airSensor.begin(Wire);
   airSensor.setAltitudeCompensation(18);
   airSensor.setAutoSelfCalibration(true);
+  airSensor.setTemperatureOffset(2.5);
   initDisplay();
 
   WiFiManager wifiManager;
