@@ -1,47 +1,53 @@
 #include <Arduino.h>
 
-#include <Wire.h>
-#include <GxEPD2_BW.h>
 #include <GxEPD2_3C.h>
-
-#include "SparkFun_SCD30_Arduino_Library.h" //Click here to get the library: http://librarymanager/All#SparkFun_SCD30
-#include <Fonts/FreeSans9pt7b.h>
+#include <GxEPD2_BW.h>
+#include <Wire.h>
 #include <Fonts/FreeSans12pt7b.h>
 #include <Fonts/FreeSans18pt7b.h>
-#include <WiFiManager.h>
-#include <NTPClient.h>
-#include "WeatherAPI.h"
-#include "icons/IconPack.h"
-#include "Icons.h"
-#include "secret_data.h"
-#include <WiFiUdp.h>
-#include <PubSubClient.h>
-#include <WiFiClientSecure.h>
-#include "cert.h"
-#include <SimpleOTA.h>
+#include <Fonts/FreeSans9pt7b.h>
+#include <SensirionI2cSht4x.h>
 
-//un'ora - seconds
+#include "Icons.h"
+#include "SparkFun_SCD30_Arduino_Library.h" //Click here to get the library: http://librarymanager/All#SparkFun_SCD30
+#include "WeatherAPI.h"
+#include "cert.h"
+#include "icons/IconPack.h"
+#include "secret_data.h"
+#include <NTPClient.h>
+#include <PubSubClient.h>
+#include <SimpleOTA.h>
+#include <WiFiClientSecure.h>
+#include <WiFiManager.h>
+#include <WiFiUdp.h>
+#include "SHTSensor.h"
+
+// un'ora - seconds
 #define REFRESH_TIME_AQI 3600;
 bool debug = false;
 
 SimpleOTA simpleOTA;
-
 SCD30 airSensor;
-GxEPD2_BW<GxEPD2_420_GDEY042T81, GxEPD2_420_GDEY042T81::HEIGHT> display(GxEPD2_420_GDEY042T81(/*CS=5*/ SS, /*DC=*/3, /*RES=*/2, /*BUSY=*/1)); // 400x300, SSD1683
-//API key, latitude and longitude
+SensirionI2cSht4x sht;
+
+GxEPD2_BW<GxEPD2_420_GDEY042T81, GxEPD2_420_GDEY042T81::HEIGHT>
+    display(GxEPD2_420_GDEY042T81(/*CS=5*/ SS, /*DC=*/3, /*RES=*/2,
+                                  /*BUSY=*/1)); // 400x300, SSD1683
+// API key, latitude and longitude
 WeatherAPI weather(WEATHER_API_KEY, LATITUDE, LONGITUDE);
 
 unsigned long nextAirRequest = 0;
 unsigned long nextSensorRequest = 0;
 unsigned long nextScreenTimeUpdate = 0;
-//usato per caricare icone in setup;
+// usato per caricare icone in setup;
 bool lableIcon = false;
-Forecast* forecasts = NULL;
+Forecast *forecasts = NULL;
 
 struct Point {
   int x;
   int y;
-}sensorPoint, forecastPoint, pollutionPoint, extTermIgroPoint, co2ValuesPoint, timePoint;
+} sensorPoint, forecastPoint, pollutionPoint, extTermIgroPoint, co2ValuesPoint,
+    timePoint;
 
 WiFiUDP udpCleint;
 NTPClient timeClient(udpCleint, 7200);
@@ -58,7 +64,8 @@ struct TermoIgro {
 } extTermIgro;
 bool extAcquired;
 
-void writePartial(String text, uint16_t x, uint16_t y, uint8_t textSize, uint8_t* retHeight = NULL, bool useFont = true) {
+void writePartial(String text, uint16_t x, uint16_t y, uint8_t textSize,
+                  uint8_t *retHeight = NULL, bool useFont = true) {
   uint8_t x_offset = 0;
   uint8_t y_offset = 3;
   int16_t x1, y1;
@@ -78,11 +85,10 @@ void writePartial(String text, uint16_t x, uint16_t y, uint8_t textSize, uint8_t
     default:
       display.setFont(NULL);
     }
-  }
-  else {
+  } else {
     display.setTextSize(textSize);
   }
-  //display.setTextSize(textSize);
+  // display.setTextSize(textSize);
   display.getTextBounds(text, x, y, &x1, &y1, &width, &height);
   if (retHeight != NULL)
     *retHeight = height;
@@ -98,7 +104,7 @@ void writePartial(String text, uint16_t x, uint16_t y, uint8_t textSize, uint8_t
   } while (display.nextPage());
 }
 
-void drawImage(const uint8_t* image, size_t x, size_t y, size_t iconSize = 64) {
+void drawImage(const uint8_t *image, size_t x, size_t y, size_t iconSize = 64) {
   display.drawImage(image, x, y, iconSize, iconSize, false, false);
 }
 
@@ -112,13 +118,12 @@ void initDisplay() {
 void connectToMQTT() {
   while (!mqtt_client.connected()) {
     String client_id = "esp32-client-" + String(WiFi.macAddress());
-    //Serial.printf("Connecting to MQTT Broker as %s...\n", client_id.c_str());
+    // Serial.printf("Connecting to MQTT Broker as %s...\n", client_id.c_str());
     if (mqtt_client.connect(client_id.c_str(), mqtt_username, mqtt_password)) {
-      //Serial.println("Connected to MQTT broker");
+      // Serial.println("Connected to MQTT broker");
       mqtt_client.subscribe(mqtt_topic);
-    }
-    else {
-      //Serial.print("Failed to connect to MQTT broker, rc=");
+    } else {
+      // Serial.print("Failed to connect to MQTT broker, rc=");
       Serial.print(mqtt_client.state());
       delay(5000);
     }
@@ -128,7 +133,7 @@ void connectToMQTT() {
 void drawHourForecast(uint8_t startIndex, Point point) {
   uint8_t iconSize = 64;
   uint8_t spacing = 5;
-  //used for hour
+  // used for hour
   uint8_t hourVerticalSpace = point.y + 18;
   uint8_t fontSize = 2;
   uint8_t contextIconOff = 15;
@@ -151,28 +156,33 @@ void drawHourForecast(uint8_t startIndex, Point point) {
       drawImage(THERMOMETER, x - contextIconOff, y += spacing, 16);
       drawImage(HUMAN, x - contextIconOff, y += 16 + spacing, 16);
       drawImage(HUMIDITY, x - contextIconOff, y += 16 + spacing, 16);
-    }
-    else {
+    } else {
       if (forecasts == NULL)
         return;
       drawImage(forecasts[i].icon, x, y);
       x += 15;
       y += iconSize;
-      //temp
+      // temp
       sprintf(buffer, "%.1f\n", forecasts[i].temp);
-      writePartial((String)buffer, x, y += spacing, fontSize, &retHeight, false);
-      //percived temp
+      writePartial((String)buffer, x, y += spacing, fontSize, &retHeight,
+                   false);
+      // percived temp
       sprintf(buffer, "%.1f\n", forecasts[i].percivedTemp);
-      writePartial((String)buffer, x, y += (retHeight + spacing), fontSize, &retHeight, false);
-      //humid
+      writePartial((String)buffer, x, y += (retHeight + spacing), fontSize,
+                   &retHeight, false);
+      // humid
       sprintf(buffer, "%02d\n", forecasts[i].humidity);
-      writePartial(buffer, x, y += (retHeight + spacing), fontSize, &retHeight, false);
-      //hour
+      writePartial(buffer, x, y += (retHeight + spacing), fontSize, &retHeight,
+                   false);
+      // hour
       uint8_t oldRot = display.getRotation();
       display.setRotation(1);
-      sprintf(buffer, "%02d:%02d\n", forecasts[i].timeStamp.hour, forecasts[i].timeStamp.minute);
-      writePartial((String)buffer, hourVerticalSpace, display.height() - (x - spacing - 20), fontSize - 1, NULL, false);
-      //Serial.println(buffer);
+      sprintf(buffer, "%02d:%02d\n", forecasts[i].timeStamp.hour,
+              forecasts[i].timeStamp.minute);
+      writePartial((String)buffer, hourVerticalSpace,
+                   display.height() - (x - spacing - 20), fontSize - 1, NULL,
+                   false);
+      // Serial.println(buffer);
       display.setRotation(oldRot);
     }
   }
@@ -191,28 +201,27 @@ void drawTempAndHumidValues(Point point, double temp, int humid) {
   if (lableIcon) {
     drawImage(THERMOMETER, x + xLableOffset, y + yLableOffset, 16);
     drawImage(HUMIDITY, x + xLableOffset, y += 32 + spacing + yLableOffset, 16);
-  }
-  else {
-    //temp
+  } else {
+    // temp
     if (temp > -100) {
       sprintf(buffer, "%02.1f\n", temp);
       writePartial((String)buffer, x, y, fontSize, &retHeight, false);
-    }
-    else {
+    } else {
       writePartial("----", x, y, fontSize, &retHeight, false);
     }
-    //humid
+    // humid
     if (humid > -1) {
       sprintf(buffer, "%02d  \n", humid);
-      writePartial(buffer, x, y += (retHeight + spacing), fontSize, &retHeight, false);
-    }
-    else {
-      writePartial("----", x, y += (retHeight + spacing), fontSize, &retHeight, false);
+      writePartial(buffer, x, y += (retHeight + spacing), fontSize, &retHeight,
+                   false);
+    } else {
+      writePartial("----", x, y += (retHeight + spacing), fontSize, &retHeight,
+                   false);
     }
   }
 }
 
-void drawAirQuality(AirQuality* aqi, Point point) {
+void drawAirQuality(AirQuality *aqi, Point point) {
   uint8_t retHeight;
   uint8_t space = 5;
   uint8_t xLableOffset = 60;
@@ -224,21 +233,22 @@ void drawAirQuality(AirQuality* aqi, Point point) {
     writePartial("AQI", x, y, 2, &retHeight, false);
     writePartial("pm2", x, y += space + retHeight, 2, &retHeight, false);
     writePartial("pm10", x, y += space + retHeight, 2, &retHeight, false);
-  }
-  else {
+  } else {
     if (aqi == NULL)
       return;
     writePartial(aqi->AQIToString(), x + xLableOffset, y, 2, &retHeight, false);
-    //pm2
+    // pm2
     sprintf(buffer, "%d  \n", aqi->pm2_5);
-    writePartial(buffer, x + xLableOffset, y += space + retHeight, 2, &retHeight, false);
-    //pm10
+    writePartial(buffer, x + xLableOffset, y += space + retHeight, 2,
+                 &retHeight, false);
+    // pm10
     sprintf(buffer, "%d  \n", aqi->pm10);
-    writePartial(buffer, x + xLableOffset, y += space + retHeight, 2, &retHeight, false);
+    writePartial(buffer, x + xLableOffset, y += space + retHeight, 2,
+                 &retHeight, false);
   }
 }
 
-void drawCo2Values(Point point, uint16_t width, uint16_t height) {
+void drawCo2Values(Point point, uint16_t width, uint16_t height, uint16_t co2) {
   int x = point.x;
   int y = point.y;
 
@@ -248,7 +258,7 @@ void drawCo2Values(Point point, uint16_t width, uint16_t height) {
   if (lableIcon) {
     int xLableOffset = 75;
     drawImage(CO2, x + xLableOffset, y, 16);
-    //dati raccolti online 
+    // dati raccolti online
     uint excelentX = x;
     uint goodX = x + (450 / (int)resolution);
     uint fairX = x + (700 / (int)resolution);
@@ -263,15 +273,16 @@ void drawCo2Values(Point point, uint16_t width, uint16_t height) {
     return;
   }
   char buffer[6];
-  int co2 = airSensor.getCO2();
   uint8_t retHeight;
   sprintf(buffer, "%05d\n", co2);
-  //metto gli spazi al posto dei leading zeros
-  for(size_t i = 0; i < strlen(buffer); i++){
-    if(buffer[i] == '0')
+  // metto gli spazi al posto dei leading zeros
+  for (size_t i = 0; i < strlen(buffer); i++) {
+    if (buffer[i] == '0' && i < 4)
       buffer[i] = ' ';
+    else
+      break;
   }
-    
+
   writePartial(buffer, x, y, 2, &retHeight, false);
   y += retHeight + 3;
   co2 = co2 > range ? range : co2;
@@ -282,7 +293,8 @@ void drawCo2Values(Point point, uint16_t width, uint16_t height) {
   do {
     display.fillRect(x, y, width, height, GxEPD_WHITE);
     display.drawRect(x, y, width, height, GxEPD_BLACK);
-    display.fillRect(x, y, co2Width, height, GxEPD_BLACK);;
+    display.fillRect(x, y, co2Width, height, GxEPD_BLACK);
+    ;
   } while (display.nextPage());
 }
 
@@ -291,7 +303,7 @@ void drawLables() {
   writePartial("int", 50, 2, 1, nullptr, false);
   writePartial("ext", 250, 2, 1, nullptr, false);
   drawTempAndHumidValues(sensorPoint, 0.0, 0);
-  drawCo2Values(co2ValuesPoint, display.width() - (10 * 2), 10);
+  drawCo2Values(co2ValuesPoint, display.width() - (10 * 2), 10, 0);
   drawAirQuality(NULL, pollutionPoint);
   drawHourForecast(0, forecastPoint);
   drawTempAndHumidValues(extTermIgroPoint, -200, -100);
@@ -300,15 +312,14 @@ void drawLables() {
 
 void UpdateAirPollution() {
   unsigned long currTime = timeClient.getEpochTime();
-  //Serial.printf("AirUpdate: %d, %d\n",currTime, nextAirRequest);
+  // Serial.printf("AirUpdate: %d, %d\n",currTime, nextAirRequest);
   if (currTime >= nextAirRequest) {
     nextAirRequest = currTime + REFRESH_TIME_AQI;
-    AirQuality* aqi;
+    AirQuality *aqi;
     if (debug) {
-      aqi = (AirQuality*)malloc(sizeof(AirQuality));
+      aqi = (AirQuality *)malloc(sizeof(AirQuality));
       *aqi = AirQuality();
-    }
-    else {
+    } else {
       aqi = weather.GetAirPollution();
     }
     if (aqi != NULL)
@@ -316,31 +327,31 @@ void UpdateAirPollution() {
   }
 }
 
-/// @brief utilizzo questa funzione poiché 
+/// @brief utilizzo questa funzione poiché
 /// capita che quando richiedo nuovi dati parta 3 ore dopo
-void getForecast(){
-  //min is 7, otherwise on update -> indexOutOfBound
+void getForecast() {
+  // min is 7, otherwise on update -> indexOutOfBound
   int size = 8;
-  Forecast * temp = NULL;
-  if(forecasts != NULL){
-    temp = (Forecast *) malloc(sizeof(Forecast) *size);
+  Forecast *temp = NULL;
+  if (forecasts != NULL) {
+    temp = (Forecast *)malloc(sizeof(Forecast) * size);
     memcpy(temp, forecasts, sizeof(Forecast) * size);
   }
   forecasts = weather.GetForecast(size);
-  //primo avvio
-  if(temp == NULL || forecasts == NULL)
+  // primo avvio
+  if (temp == NULL || forecasts == NULL)
     return;
   unsigned long currTime = timeClient.getEpochTime();
-  //valuto se il primo oggetto rientra nella previsione corrente
-  if(forecasts[0].timeStamp.getUnix() < currTime)
+  // valuto se il primo oggetto rientra nella previsione corrente
+  if (forecasts[0].timeStamp.getUnix() < currTime)
     return;
-  //altrimenti copio il vecchio elemento nella prima posizione;
+  // altrimenti copio il vecchio elemento nella prima posizione;
   int positionOldArray = 0;
-  for(size_t i = 0; i < size; i++){
-    if((temp[i].timeStamp.getUnix() + (3600*3)) > currTime){
-      //shifto in avanti
-      for(size_t j = size - 1; j >= 1; j--){
-        forecasts[j] = forecasts[j-1] ;
+  for (size_t i = 0; i < size; i++) {
+    if ((temp[i].timeStamp.getUnix() + (3600 * 3)) > currTime) {
+      // shifto in avanti
+      for (size_t j = size - 1; j >= 1; j--) {
+        forecasts[j] = forecasts[j - 1];
       }
       positionOldArray = i;
       break;
@@ -352,23 +363,25 @@ void getForecast(){
 
 void UpdateForecast() {
 
-  if (forecasts == NULL || timeClient.getEpochTime() > (forecasts[0].timeStamp.getUnix()+(3600*3))) {
-    //aggiorno dati ogni 9 ore: 2 *
+  if (forecasts == NULL ||
+      timeClient.getEpochTime() >
+          forecasts[currForecastIdx + 1].timeStamp.getUnix()) {
+    // aggiorno dati ogni 9 ore: 2 *
     if (forecasts == NULL || currForecastIdx >= 3) {
       if (debug) {
-        //DEBUG
-        forecasts = (Forecast*)malloc(4 * sizeof(Forecast));
+        // DEBUG
+        forecasts = (Forecast *)malloc(4 * sizeof(Forecast));
         forecasts[0] = Forecast(SUN_01D, 23.2, 24.54, 30);
         forecasts[1] = Forecast(MOON_02N, 15.2, 24.54, 30);
         forecasts[2] = Forecast(CLOUDSUN_02D, 25.2, 24.54, 30);
         forecasts[3] = Forecast(SHOWERRAIN_09, 23.2, 24.54, 30);
-      }
-      else {
+      } else {
         getForecast();
       }
       currForecastIdx = 0;
     }
-    //Serial.printf("UpdateForecast: %d, %d\n",timeClient.getEpochTime() , forecasts[currForecastIdx].timeStamp.getUnix());
+    // Serial.printf("UpdateForecast: %d, %d\n",timeClient.getEpochTime() ,
+    // forecasts[currForecastIdx].timeStamp.getUnix());
     drawHourForecast(currForecastIdx, forecastPoint);
     currForecastIdx++;
   }
@@ -394,7 +407,7 @@ void setPoints() {
   timePoint.y = 5;
 }
 
-void mqttCallback(char* topic, byte* payload, unsigned int length) {
+void mqttCallback(char *topic, byte *payload, unsigned int length) {
   JsonDocument doc;
   deserializeJson(doc, payload);
   extTermIgro.temp = doc["temp"].as<double>();
@@ -405,35 +418,37 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
 }
 
 void updateTime() {
-  //aggiorno ogni 60 secondi
+  // aggiorno ogni 60 secondi
   if (timeClient.getEpochTime() > nextScreenTimeUpdate) {
     nextScreenTimeUpdate = timeClient.getEpochTime() + 60;
     char buffer[6];
-    sprintf(buffer, "%02d:%02d\n", timeClient.getHours(), timeClient.getMinutes());
+    sprintf(buffer, "%02d:%02d\n", timeClient.getHours(),
+            timeClient.getMinutes());
     writePartial(buffer, timePoint.x, timePoint.y, 2, NULL, false);
   }
 }
 
 void setup() {
-  if(debug)
+  if (debug)
     Serial.begin(115200);
   Wire.begin();
-  airSensor.begin(Wire);
+  airSensor.begin(Wire, true);
   airSensor.setAltitudeCompensation(18);
-  airSensor.setAutoSelfCalibration(true);
-  airSensor.setTemperatureOffset(2.5);
+  sht.begin(Wire, SHT41_I2C_ADDR_44);
   initDisplay();
 
   WiFiManager wifiManager;
   wifiManager.setConfigPortalTimeout(120);
   wifiManager.autoConnect("WeatherStation");
+  wifiManager.setDarkMode(true);
+  wifiManager.setShowInfoUpdate(false);
 
   simpleOTA.begin(64, ota_server_url, token_id, true);
 
   timeClient.begin();
-  
-  //sincronizzo ogni 10 minuti
-  timeClient.setUpdateInterval(600000);//10 minuti
+
+  // sincronizzo ogni 60 minuti
+  timeClient.setUpdateInterval(36e5); // 10 minuti
 
   esp_client.setCACert(ssl_ca_cert);
   esp_client.setInsecure();
@@ -449,33 +464,37 @@ void setup() {
 void updateSensorValues() {
   if (millis() > nextSensorRequest && airSensor.dataAvailable()) {
     nextSensorRequest = millis() + 20000;
-    drawTempAndHumidValues(sensorPoint, airSensor.getTemperature(), (int)airSensor.getHumidity());
-    drawCo2Values(co2ValuesPoint, display.width() - (10 * 2), 15);
+    float shtTemp, shtHum;
+    sht.measureHighPrecision(shtTemp, shtHum);
+    drawTempAndHumidValues(sensorPoint, shtTemp, (int)shtHum);
+    drawCo2Values(co2ValuesPoint, display.width() - (10 * 2), 15, airSensor.getCO2());
   }
 }
 
 void updateExternalTemperature() {
-  //se oltre 20 minuti non ricevo nulla azzero 
-  if (extAcquired && timeClient.getEpochTime() > extTermIgro.dt + 1200) {//20 muinuti
+  // se oltre 20 minuti non ricevo nulla azzero
+  if (extAcquired &&
+      timeClient.getEpochTime() > extTermIgro.dt + 1200) { // 20 muinuti
     drawTempAndHumidValues(extTermIgroPoint, -200, -100);
     extAcquired = false;
   }
 }
 
 void loop() {
-  simpleOTA.checkUpdates(86400);//24 ore
+  simpleOTA.checkUpdates(86400); // 24 ore
 
   timeClient.update();
   updateTime();
   updateSensorValues();
-  //AQI
+  // AQI
   UpdateAirPollution();
-  //FORECAST
+  // FORECAST
   UpdateForecast();
-  //MQTT
+  // MQTT
   if (!mqtt_client.connected())
     connectToMQTT();
   mqtt_client.loop();
-  //EXT_SENSOR
+  // EXT_SENSOR
   updateExternalTemperature();
+  // display.hibernate();
 }
