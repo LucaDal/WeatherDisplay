@@ -1,3 +1,5 @@
 .pio
 .vscode/*
 **/secret_data.h
+.cache/
+compile_commands.json

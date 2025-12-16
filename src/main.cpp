@@ -1,14 +1,21 @@
 #include <Arduino.h>
 
-#include <GxEPD2_3C.h>
-#include <GxEPD2_BW.h>
-#include <Wire.h>
+#include <ArduinoJson.h>
 #include <Fonts/FreeSans12pt7b.h>
 #include <Fonts/FreeSans18pt7b.h>
 #include <Fonts/FreeSans9pt7b.h>
+#include <GxEPD2_3C.h>
+#include <GxEPD2_BW.h>
 #include <SensirionI2cSht4x.h>
+#include <Wire.h>
 
+#include "CommonDebug.h"
+#include "DeviceSetupManager.h"
+#include "EEPROM.h"
 #include "Icons.h"
+#include "LiteWiFiManager.h"
+#include "MyDeviceProperties.h"
+#include "SHTSensor.h"
 #include "SparkFun_SCD30_Arduino_Library.h" //Click here to get the library: http://librarymanager/All#SparkFun_SCD30
 #include "WeatherAPI.h"
 #include "cert.h"
@@ -18,15 +25,23 @@
 #include <PubSubClient.h>
 #include <SimpleOTA.h>
 #include <WiFiClientSecure.h>
-#include <WiFiManager.h>
 #include <WiFiUdp.h>
-#include "SHTSensor.h"
+#include <memory>
 
-// un'ora - seconds
+const int MQTT_PORT = 8883;
+const int EEPROM_SIZE = 4096;
+#define LOG(msg) DBG_LOG("", msg)
+#define LOGF(fmt, ...) DBG_LOGF("", fmt, ##__VA_ARGS__)
 #define REFRESH_TIME_AQI 3600;
+// un'ora - seconds
 bool debug = false;
 
+MyDeviceProperties deviceProperties(EEPROM_SIZE, 0, 3, 1024, true);
+DeviceSetupManager setupMgr(EEPROM_SIZE, 3);
+LiteWiFiManager wifiProvision;
 SimpleOTA simpleOTA;
+const char *DEVICE_ID;
+
 SCD30 airSensor;
 SensirionI2cSht4x sht;
 
@@ -34,7 +49,7 @@ GxEPD2_BW<GxEPD2_420_GDEY042T81, GxEPD2_420_GDEY042T81::HEIGHT>
     display(GxEPD2_420_GDEY042T81(/*CS=5*/ SS, /*DC=*/3, /*RES=*/2,
                                   /*BUSY=*/1)); // 400x300, SSD1683
 // API key, latitude and longitude
-WeatherAPI weather(WEATHER_API_KEY, LATITUDE, LONGITUDE);
+std::unique_ptr<WeatherAPI> weather;
 
 unsigned long nextAirRequest = 0;
 unsigned long nextSensorRequest = 0;
@@ -42,6 +57,7 @@ unsigned long nextScreenTimeUpdate = 0;
 // usato per caricare icone in setup;
 bool lableIcon = false;
 Forecast *forecasts = NULL;
+size_t forecastsCount = 0;
 
 struct Point {
   int x;
@@ -49,8 +65,8 @@ struct Point {
 } sensorPoint, forecastPoint, pollutionPoint, extTermIgroPoint, co2ValuesPoint,
     timePoint;
 
-WiFiUDP udpCleint;
-NTPClient timeClient(udpCleint, 7200);
+WiFiUDP udpClient;
+NTPClient timeClient(udpClient, 7200);
 
 uint8_t currForecastIdx = 0;
 
@@ -116,17 +132,20 @@ void initDisplay() {
 }
 
 void connectToMQTT() {
-  while (!mqtt_client.connected()) {
-    String client_id = "esp32-client-" + String(WiFi.macAddress());
-    // Serial.printf("Connecting to MQTT Broker as %s...\n", client_id.c_str());
-    if (mqtt_client.connect(client_id.c_str(), mqtt_username, mqtt_password)) {
-      // Serial.println("Connected to MQTT broker");
-      mqtt_client.subscribe(mqtt_topic);
-    } else {
-      // Serial.print("Failed to connect to MQTT broker, rc=");
-      Serial.print(mqtt_client.state());
-      delay(5000);
-    }
+  JsonDocument &doc = deviceProperties.json();
+  const char *mqtt_topic = doc["topic_igrometro"] | "";
+  const char *mqtt_password = doc["password"] | "";
+  const char *mqtt_username = doc["username"] | "";
+  String client_id = "esp32-client-" + String(WiFi.macAddress());
+  LOGF("Connecting to MQTT Broker as %s...\n", client_id.c_str());
+  LOGF("topic: [%s], pw:  [%s], user: [%s]\n", mqtt_topic, mqtt_password,
+       mqtt_username);
+  if (mqtt_client.connect(client_id.c_str(), mqtt_username, mqtt_password)) {
+    LOG("Connected to MQTT broker");
+    mqtt_client.subscribe(mqtt_topic);
+  } else {
+    LOGF("Failed to connect to MQTT broker, rc=%d\n", mqtt_client.state());
+    delay(5000);
   }
 }
 
@@ -139,7 +158,12 @@ void drawHourForecast(uint8_t startIndex, Point point) {
   uint8_t contextIconOff = 15;
   int x;
   int y;
-  for (size_t i = startIndex; i < startIndex + 4; i++) {
+  if (forecasts == NULL || forecastsCount == 0 || startIndex >= forecastsCount)
+    return;
+  size_t end = startIndex + 4;
+  if (end > forecastsCount)
+    end = forecastsCount;
+  for (size_t i = startIndex; i < end; i++) {
 
     if (i == 0)
       x = point.x;
@@ -157,8 +181,6 @@ void drawHourForecast(uint8_t startIndex, Point point) {
       drawImage(HUMAN, x - contextIconOff, y += 16 + spacing, 16);
       drawImage(HUMIDITY, x - contextIconOff, y += 16 + spacing, 16);
     } else {
-      if (forecasts == NULL)
-        return;
       drawImage(forecasts[i].icon, x, y);
       x += 15;
       y += iconSize;
@@ -182,7 +204,7 @@ void drawHourForecast(uint8_t startIndex, Point point) {
       writePartial((String)buffer, hourVerticalSpace,
                    display.height() - (x - spacing - 20), fontSize - 1, NULL,
                    false);
-      // Serial.println(buffer);
+      LOG(buffer);
       display.setRotation(oldRot);
     }
   }
@@ -312,15 +334,16 @@ void drawLables() {
 
 void UpdateAirPollution() {
   unsigned long currTime = timeClient.getEpochTime();
-  // Serial.printf("AirUpdate: %d, %d\n",currTime, nextAirRequest);
+  LOGF("AirUpdate: %d, %d\n", currTime, nextAirRequest);
   if (currTime >= nextAirRequest) {
     nextAirRequest = currTime + REFRESH_TIME_AQI;
-    AirQuality *aqi;
+    AirQuality *aqi = nullptr;
     if (debug) {
-      aqi = (AirQuality *)malloc(sizeof(AirQuality));
-      *aqi = AirQuality();
+      static AirQuality debugAqi;
+      debugAqi = AirQuality();
+      aqi = &debugAqi;
     } else {
-      aqi = weather.GetAirPollution();
+      aqi = weather->GetAirPollution();
     }
     if (aqi != NULL)
       drawAirQuality(aqi, pollutionPoint);
@@ -331,39 +354,54 @@ void UpdateAirPollution() {
 /// capita che quando richiedo nuovi dati parta 3 ore dopo
 void getForecast() {
   // min is 7, otherwise on update -> indexOutOfBound
-  int size = 8;
+  const size_t maxSize = 8;
+  size_t previousCount = forecastsCount;
   Forecast *temp = NULL;
-  if (forecasts != NULL) {
-    temp = (Forecast *)malloc(sizeof(Forecast) * size);
-    memcpy(temp, forecasts, sizeof(Forecast) * size);
+  if (forecasts != NULL && previousCount > 0) {
+    temp = (Forecast *)malloc(sizeof(Forecast) * previousCount);
+    if (temp != NULL)
+      memcpy(temp, forecasts, sizeof(Forecast) * previousCount);
   }
-  forecasts = weather.GetForecast(size);
+  forecasts = weather->GetForecast(maxSize);
+  forecastsCount = weather->GetForecastCount();
   // primo avvio
-  if (temp == NULL || forecasts == NULL)
+  if (forecasts == NULL || forecastsCount == 0) {
+    if (temp != NULL)
+      free(temp);
     return;
+  }
   unsigned long currTime = timeClient.getEpochTime();
   // valuto se il primo oggetto rientra nella previsione corrente
-  if (forecasts[0].timeStamp.getUnix() < currTime)
+  if (forecasts[0].timeStamp.getUnix() < currTime) {
+    if (temp != NULL)
+      free(temp);
     return;
+  }
   // altrimenti copio il vecchio elemento nella prima posizione;
   int positionOldArray = 0;
-  for (size_t i = 0; i < size; i++) {
-    if ((temp[i].timeStamp.getUnix() + (3600 * 3)) > currTime) {
-      // shifto in avanti
-      for (size_t j = size - 1; j >= 1; j--) {
-        forecasts[j] = forecasts[j - 1];
+  if (temp != NULL && previousCount > 0) {
+    for (size_t i = 0; i < previousCount; i++) {
+      if ((temp[i].timeStamp.getUnix() + (3600 * 3)) > currTime) {
+        // shifto in avanti
+        if (forecastsCount > 1) {
+          for (size_t j = forecastsCount; j > 1; j--) {
+            forecasts[j - 1] = forecasts[j - 2];
+          }
+        }
+        positionOldArray = i;
+        forecasts[0] = temp[positionOldArray];
+        break;
       }
-      positionOldArray = i;
-      break;
     }
   }
-  forecasts[0] = temp[positionOldArray];
-  free(temp);
+  if (temp != NULL)
+    free(temp);
 }
 
 void UpdateForecast() {
 
-  if (forecasts == NULL ||
+  if (forecasts == NULL || forecastsCount == 0 ||
+      currForecastIdx + 1 >= forecastsCount ||
       timeClient.getEpochTime() >
           forecasts[currForecastIdx + 1].timeStamp.getUnix()) {
     // aggiorno dati ogni 9 ore: 2 *
@@ -375,15 +413,17 @@ void UpdateForecast() {
         forecasts[1] = Forecast(MOON_02N, 15.2, 24.54, 30);
         forecasts[2] = Forecast(CLOUDSUN_02D, 25.2, 24.54, 30);
         forecasts[3] = Forecast(SHOWERRAIN_09, 23.2, 24.54, 30);
+        forecastsCount = 4;
       } else {
         getForecast();
       }
       currForecastIdx = 0;
     }
-    // Serial.printf("UpdateForecast: %d, %d\n",timeClient.getEpochTime() ,
-    // forecasts[currForecastIdx].timeStamp.getUnix());
+    LOGF("UpdateForecast: %d, %d\n", timeClient.getEpochTime(),
+         forecasts[currForecastIdx].timeStamp.getUnix());
     drawHourForecast(currForecastIdx, forecastPoint);
-    currForecastIdx++;
+    if (currForecastIdx + 1 < forecastsCount)
+      currForecastIdx++;
   }
 }
 
@@ -409,7 +449,9 @@ void setPoints() {
 
 void mqttCallback(char *topic, byte *payload, unsigned int length) {
   JsonDocument doc;
-  deserializeJson(doc, payload);
+  DeserializationError err = deserializeJson(doc, payload, length);
+  if (err)
+    return;
   extTermIgro.temp = doc["temp"].as<double>();
   extTermIgro.humid = doc["umid"].as<uint8_t>();
   extTermIgro.dt = timeClient.getEpochTime();
@@ -429,30 +471,34 @@ void updateTime() {
 }
 
 void setup() {
-  if (debug)
-    Serial.begin(115200);
+  Serial.begin(115200);
   Wire.begin();
   airSensor.begin(Wire, true);
   airSensor.setAltitudeCompensation(18);
   sht.begin(Wire, SHT41_I2C_ADDR_44);
   initDisplay();
+  wifiProvision.begin("Weather Display");
+  size_t nextOffset = 0;
+  // Setup device previously settled up
+  setupMgr.begin();
 
-  WiFiManager wifiManager;
-  wifiManager.setConfigPortalTimeout(120);
-  wifiManager.autoConnect("WeatherStation");
-  wifiManager.setDarkMode(true);
-  wifiManager.setShowInfoUpdate(false);
-
-  simpleOTA.begin(64, ota_server_url, token_id, true);
-
+  DEVICE_ID = setupMgr.readCString(0, &nextOffset);
+  deviceProperties.begin(PORTAL_SERVER_IP, DEVICE_ID, nextOffset);
+  deviceProperties.fetchAndStoreIfChanged();
+  simpleOTA.begin(EEPROM_SIZE, PORTAL_SERVER_IP, DEVICE_ID, true);
   timeClient.begin();
 
+  JsonDocument &doc = deviceProperties.json();
+  const char *lat = doc["latitude"] | "";
+  const char *lon = doc["longitude"] | "";
+  LOGF("lat: %s, lon %s\n", lat, lon);
+  weather.reset(new WeatherAPI(WEATHER_API_KEY, lat, lon));
   // sincronizzo ogni 60 minuti
   timeClient.setUpdateInterval(36e5); // 10 minuti
 
   esp_client.setCACert(ssl_ca_cert);
   esp_client.setInsecure();
-  mqtt_client.setServer(mqtt_broker, mqtt_port);
+  mqtt_client.setServer(MQTT_BROKER, MQTT_PORT);
   mqtt_client.setKeepAlive(60);
   mqtt_client.setCallback(mqttCallback);
   connectToMQTT();
@@ -467,7 +513,8 @@ void updateSensorValues() {
     float shtTemp, shtHum;
     sht.measureHighPrecision(shtTemp, shtHum);
     drawTempAndHumidValues(sensorPoint, shtTemp, (int)shtHum);
-    drawCo2Values(co2ValuesPoint, display.width() - (10 * 2), 15, airSensor.getCO2());
+    drawCo2Values(co2ValuesPoint, display.width() - (10 * 2), 15,
+                  airSensor.getCO2());
   }
 }
 
