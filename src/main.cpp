@@ -90,6 +90,17 @@ void writePartial(String text, uint16_t x, uint16_t y, uint8_t textSize,
   const uint8_t y_offset = 3;
   int16_t x1, y1;
   uint16_t width, height;
+  struct PartialCache {
+    uint16_t x;
+    uint16_t y;
+    uint8_t textSize;
+    bool useFont;
+    uint16_t width;
+    uint16_t height;
+    bool used;
+  };
+  static PartialCache cache[16] = {};
+  static uint8_t cacheNext = 0;
 
   if (useFont) {
     switch (textSize) {
@@ -106,16 +117,46 @@ void writePartial(String text, uint16_t x, uint16_t y, uint8_t textSize,
       display.setFont(nullptr);
     }
   } else {
+    display.setFont(nullptr);
     display.setTextSize(textSize);
   }
   // display.setTextSize(textSize);
   display.getTextBounds(text, x, y, &x1, &y1, &width, &height);
   if (retHeight != nullptr)
     *retHeight = height;
-  display.setPartialWindow(x, y, width + x_offset, height + y_offset);
+  int16_t clearWidth = (int16_t)width + x_offset + 2;
+  int16_t clearHeight = (int16_t)height + y_offset + 2;
+  if (clearWidth < 0)
+    clearWidth = 0;
+  if (clearHeight < 0)
+    clearHeight = 0;
+  bool cacheHit = false;
+  for (size_t i = 0; i < (sizeof(cache) / sizeof(cache[0])); i++) {
+    if (!cache[i].used)
+      continue;
+    if (cache[i].x == x && cache[i].y == y && cache[i].textSize == textSize &&
+        cache[i].useFont == useFont) {
+      if (cache[i].width > (uint16_t)clearWidth)
+        clearWidth = cache[i].width;
+      if (cache[i].height > (uint16_t)clearHeight)
+        clearHeight = cache[i].height;
+      cache[i].width = clearWidth;
+      cache[i].height = clearHeight;
+      cacheHit = true;
+      break;
+    }
+  }
+  if (!cacheHit) {
+    cache[cacheNext] = {x, y, textSize, useFont, (uint16_t)clearWidth,
+                        (uint16_t)clearHeight, true};
+    cacheNext = (cacheNext + 1) % (sizeof(cache) / sizeof(cache[0]));
+  }
+  display.setPartialWindow(x, y, (uint16_t)clearWidth,
+                           (uint16_t)clearHeight);
   display.firstPage();
   do {
-    display.fillRect(x, y, width + x_offset, height, GxEPD_WHITE);
+    display.fillRect(x, y, (uint16_t)clearWidth, (uint16_t)clearHeight,
+                     GxEPD_WHITE);
     uint8_t offset = 0;
     if (useFont)
       offset = height;
@@ -150,6 +191,13 @@ void drawCenteredStatus(const char *text) {
   display.getTextBounds(text, 0, 0, &x1, &y1, &width, &height);
   int16_t x = (display.width() - width) / 2 - x1;
   int16_t y = (display.height() - height) / 2 - y1;
+  for (uint8_t i = 0; i < 2; i++) {
+    display.setFullWindow();
+    display.firstPage();
+    do {
+      display.fillScreen(GxEPD_WHITE);
+    } while (display.nextPage());
+  }
   display.setFullWindow();
   display.firstPage();
   do {
@@ -172,6 +220,36 @@ void drawLabelText(const char *text, int16_t x, int16_t y, uint8_t textSize,
   display.print(text);
 }
 
+void drawLabelTextCleared(const char *text, int16_t x, int16_t y,
+                          uint8_t textSize, uint16_t *retHeight = nullptr) {
+  int16_t x1, y1;
+  uint16_t width, height;
+  display.setFont(nullptr);
+  display.setTextSize(textSize);
+  display.getTextBounds(text, x, y, &x1, &y1, &width, &height);
+  if (retHeight != nullptr)
+    *retHeight = height;
+  int16_t rx = x1 - 1;
+  int16_t ry = y1 - 1;
+  int16_t rw = (int16_t)width + 2;
+  int16_t rh = (int16_t)height + 2;
+  if (rx < 0) {
+    rw = rw + rx;
+    rx = 0;
+  }
+  if (ry < 0) {
+    rh = rh + ry;
+    ry = 0;
+  }
+  if (rw < 0)
+    rw = 0;
+  if (rh < 0)
+    rh = 0;
+  display.fillRect(rx, ry, (uint16_t)rw, (uint16_t)rh, GxEPD_WHITE);
+  display.setCursor(x, y);
+  display.print(text);
+}
+
 void drawAirQualityLabels(Point point) {
   const uint8_t space = 5;
   uint16_t x = point.x;
@@ -183,6 +261,14 @@ void drawAirQualityLabels(Point point) {
   drawLabelText("pm2", x, y, 2, &retHeight);
   y += space + retHeight;
   drawLabelText("pm10", x, y, 2, &retHeight);
+}
+
+void drawForecastContextIcons(int16_t x, int16_t y, uint8_t iconSize,
+                              uint8_t spacing, uint8_t contextIconOff) {
+  y += iconSize;
+  drawImage(THERMOMETER, x - contextIconOff, y += spacing, 16);
+  drawImage(HUMAN, x - contextIconOff, y += 16 + spacing, 16);
+  drawImage(HUMIDITY, x - contextIconOff, y += 16 + spacing, 16);
 }
 
 void drawStaticLayout() {
@@ -229,6 +315,13 @@ void drawHourForecast(uint8_t startIndex, Point point) {
   const uint8_t contextIconOff = 15;
   int x;
   int y;
+  if (labelIcon) {
+    for (size_t i = 0; i < FORECAST_SLOTS; i++) {
+      x = point.x + (i * 102);
+      drawForecastContextIcons(x, point.y, iconSize, spacing, contextIconOff);
+    }
+    return;
+  }
   if (forecasts == nullptr || forecastsCount == 0 ||
       startIndex >= forecastsCount)
     return;
@@ -244,38 +337,30 @@ void drawHourForecast(uint8_t startIndex, Point point) {
     char buffer[10];
     uint8_t retHeight = 0;
 
-    if (labelIcon) {
-      y += iconSize;
-      drawImage(THERMOMETER, x - contextIconOff, y += spacing, 16);
-      drawImage(HUMAN, x - contextIconOff, y += 16 + spacing, 16);
-      drawImage(HUMIDITY, x - contextIconOff, y += 16 + spacing, 16);
-    } else {
-      drawImage(forecasts[i].icon, x, y);
-      x += 15;
-      y += iconSize;
-      // temp
-      sprintf(buffer, "%.1f\n", forecasts[i].temp);
-      writePartial((String)buffer, x, y += spacing, fontSize, &retHeight,
-                   false);
-      // percived temp
-      sprintf(buffer, "%.1f\n", forecasts[i].percivedTemp);
-      writePartial((String)buffer, x, y += (retHeight + spacing), fontSize,
-                   &retHeight, false);
-      // humid
-      sprintf(buffer, "%02d\n", forecasts[i].humidity);
-      writePartial(buffer, x, y += (retHeight + spacing), fontSize, &retHeight,
-                   false);
-      // hour
-      uint8_t oldRot = display.getRotation();
-      display.setRotation(1);
-      sprintf(buffer, "%02d:%02d\n", forecasts[i].timeStamp.hour,
-              forecasts[i].timeStamp.minute);
-      writePartial((String)buffer, hourVerticalSpace,
-                   display.height() - (x - spacing - 20), fontSize - 1, nullptr,
-                   false);
-      LOG(buffer);
-      display.setRotation(oldRot);
-    }
+    drawImage(forecasts[i].icon, x, y);
+    x += 15;
+    y += iconSize;
+    // temp
+    sprintf(buffer, "%.1f\n", forecasts[i].temp);
+    writePartial((String)buffer, x, y += spacing, fontSize, &retHeight, false);
+    // percived temp
+    sprintf(buffer, "%.1f\n", forecasts[i].percivedTemp);
+    writePartial((String)buffer, x, y += (retHeight + spacing), fontSize,
+                 &retHeight, false);
+    // humid
+    sprintf(buffer, "%02d\n", forecasts[i].humidity);
+    writePartial(buffer, x, y += (retHeight + spacing), fontSize, &retHeight,
+                 false);
+    // hour
+    uint8_t oldRot = display.getRotation();
+    display.setRotation(1);
+    sprintf(buffer, "%02d:%02d\n", forecasts[i].timeStamp.hour,
+            forecasts[i].timeStamp.minute);
+    writePartial((String)buffer, hourVerticalSpace,
+                 display.height() - (x - spacing - 20), fontSize - 1, nullptr,
+                 false);
+    LOG(buffer);
+    display.setRotation(oldRot);
   }
 }
 
@@ -426,29 +511,31 @@ void getForecast() {
     return;
   }
   unsigned long currTime = timeClient.getEpochTime();
-  // valuto se il primo oggetto rientra nella previsione corrente
-  if (forecasts[0].timeStamp.getUnix() < currTime) {
+  size_t currentIdx = forecastsCount;
+  for (size_t i = 0; i < forecastsCount; i++) {
+    if (forecasts[i].timeStamp.getUnix() <= currTime)
+      currentIdx = i;
+  }
+
+  if (currentIdx == forecastsCount) {
+    if (temp != nullptr && previousCount > 0 &&
+        previousCount <= forecastsCount) {
+      memcpy(forecasts, temp, sizeof(Forecast) * previousCount);
+      forecastsCount = previousCount;
+    }
     if (temp != nullptr)
       free(temp);
     return;
   }
-  // altrimenti copio il vecchio elemento nella prima posizione;
-  int positionOldArray = 0;
-  if (temp != nullptr && previousCount > 0) {
-    for (size_t i = 0; i < previousCount; i++) {
-      if ((temp[i].timeStamp.getUnix() + (3600 * 3)) > currTime) {
-        // shifto in avanti
-        if (forecastsCount > 1) {
-          for (size_t j = forecastsCount; j > 1; j--) {
-            forecasts[j - 1] = forecasts[j - 2];
-          }
-        }
-        positionOldArray = i;
-        forecasts[0] = temp[positionOldArray];
-        break;
-      }
+
+  if (currentIdx > 0) {
+    size_t newCount = forecastsCount - currentIdx;
+    for (size_t i = 0; i < newCount; i++) {
+      forecasts[i] = forecasts[i + currentIdx];
     }
+    forecastsCount = newCount;
   }
+
   if (temp != nullptr)
     free(temp);
 }
