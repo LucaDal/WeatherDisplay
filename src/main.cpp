@@ -191,13 +191,6 @@ void drawCenteredStatus(const char *text) {
   display.getTextBounds(text, 0, 0, &x1, &y1, &width, &height);
   int16_t x = (display.width() - width) / 2 - x1;
   int16_t y = (display.height() - height) / 2 - y1;
-  for (uint8_t i = 0; i < 2; i++) {
-    display.setFullWindow();
-    display.firstPage();
-    do {
-      display.fillScreen(GxEPD_WHITE);
-    } while (display.nextPage());
-  }
   display.setFullWindow();
   display.firstPage();
   do {
@@ -313,11 +306,12 @@ void drawHourForecast(uint8_t startIndex, Point point) {
   const uint8_t hourVerticalSpace = point.y + 18;
   const uint8_t fontSize = 2;
   const uint8_t contextIconOff = 15;
+  const uint8_t columnWidth = 102;
   int x;
   int y;
   if (labelIcon) {
     for (size_t i = 0; i < FORECAST_SLOTS; i++) {
-      x = point.x + (i * 102);
+      x = point.x + (i * columnWidth);
       drawForecastContextIcons(x, point.y, iconSize, spacing, contextIconOff);
     }
     return;
@@ -330,27 +324,35 @@ void drawHourForecast(uint8_t startIndex, Point point) {
     end = forecastsCount;
   for (size_t i = startIndex; i < end; i++) {
     size_t column = i - startIndex;
-    x = point.x + (column * 102);
+    x = point.x + (column * columnWidth);
 
     y = point.y;
 
     char buffer[10];
-    uint8_t retHeight = 0;
 
     drawImage(forecasts[i].icon, x, y);
     x += 15;
     y += iconSize;
-    // temp
-    sprintf(buffer, "%.1f\n", forecasts[i].temp);
-    writePartial((String)buffer, x, y += spacing, fontSize, &retHeight, false);
-    // percived temp
-    sprintf(buffer, "%.1f\n", forecasts[i].percivedTemp);
-    writePartial((String)buffer, x, y += (retHeight + spacing), fontSize,
-                 &retHeight, false);
-    // humid
-    sprintf(buffer, "%02d\n", forecasts[i].humidity);
-    writePartial(buffer, x, y += (retHeight + spacing), fontSize, &retHeight,
-                 false);
+    int textX = x;
+    int textY = y + spacing;
+    int lineHeight = 8 * fontSize;
+    int textBlockH = (lineHeight * 3) + (spacing * 2);
+    display.setPartialWindow(textX, textY, columnWidth - 15, textBlockH);
+    display.firstPage();
+    do {
+      display.fillRect(textX, textY, columnWidth - 15, textBlockH,
+                       GxEPD_WHITE);
+      // temp
+      sprintf(buffer, "%.1f", forecasts[i].temp);
+      drawLabelText(buffer, textX, textY, fontSize);
+      // percived temp
+      sprintf(buffer, "%.1f", forecasts[i].percivedTemp);
+      drawLabelText(buffer, textX, textY + lineHeight + spacing, fontSize);
+      // humid
+      sprintf(buffer, "%02d", forecasts[i].humidity);
+      drawLabelText(buffer, textX,
+                    textY + (lineHeight + spacing) * 2, fontSize);
+    } while (display.nextPage());
     // hour
     uint8_t oldRot = display.getRotation();
     display.setRotation(1);
@@ -366,7 +368,7 @@ void drawHourForecast(uint8_t startIndex, Point point) {
 
 void drawTempAndHumidValues(Point point, double temp, int humid) {
   char buffer[10];
-  uint8_t retHeight = 0;
+  uint16_t retHeight = 0;
   const uint8_t spacing = 10;
   const uint8_t fontSize = 4;
   const uint8_t xLableOffset = 105;
@@ -378,27 +380,44 @@ void drawTempAndHumidValues(Point point, double temp, int humid) {
     drawImage(THERMOMETER, x + xLableOffset, y + yLableOffset, 16);
     drawImage(HUMIDITY, x + xLableOffset, y += 32 + spacing + yLableOffset, 16);
   } else {
-    // temp
-    if (temp > -100) {
-      sprintf(buffer, "%02.1f\n", temp);
-      writePartial((String)buffer, x, y, fontSize, &retHeight, false);
-    } else {
-      writePartial("----", x, y, fontSize, &retHeight, false);
-    }
-    // humid
-    if (humid > -1) {
-      sprintf(buffer, "%02d  \n", humid);
-      writePartial(buffer, x, y += (retHeight + spacing), fontSize, &retHeight,
-                   false);
-    } else {
-      writePartial("----", x, y += (retHeight + spacing), fontSize, &retHeight,
-                   false);
-    }
+    char tempBuf[8];
+    char humidBuf[8];
+    if (temp > -100)
+      sprintf(tempBuf, "%02.1f", temp);
+    else
+      snprintf(tempBuf, sizeof(tempBuf), "----");
+    if (humid > -1)
+      sprintf(humidBuf, "%02d", humid);
+    else
+      snprintf(humidBuf, sizeof(humidBuf), "----");
+
+    int16_t x1, y1;
+    uint16_t w, h;
+    display.setFont(nullptr);
+    display.setTextSize(fontSize);
+    display.getTextBounds(tempBuf, x, y, &x1, &y1, &w, &h);
+    uint16_t maxW = w;
+    uint16_t lineH = h;
+    display.getTextBounds(humidBuf, x, y, &x1, &y1, &w, &h);
+    if (w > maxW)
+      maxW = w;
+    if (h > lineH)
+      lineH = h;
+    uint16_t windowW = maxW + 2;
+    uint16_t windowH = (lineH * 2) + spacing + 2;
+
+    display.setPartialWindow(x, y, windowW, windowH);
+    display.firstPage();
+    do {
+      display.fillRect(x, y, windowW, windowH, GxEPD_WHITE);
+      drawLabelText(tempBuf, x, y, fontSize, &retHeight);
+      drawLabelText(humidBuf, x, y + lineH + spacing, fontSize, &retHeight);
+    } while (display.nextPage());
   }
 }
 
 void drawAirQuality(AirQuality *aqi, Point point) {
-  uint8_t retHeight;
+  uint16_t retHeight;
   const uint8_t space = 5;
   const uint8_t xLableOffset = 60;
   uint16_t x = point.x;
@@ -411,15 +430,23 @@ void drawAirQuality(AirQuality *aqi, Point point) {
   }
   if (aqi == nullptr)
     return;
-  writePartial(aqi->AQIToString(), x + xLableOffset, y, 2, &retHeight, false);
-  // pm2
-  sprintf(buffer, "%d  \n", aqi->pm2_5);
-  writePartial(buffer, x + xLableOffset, y += space + retHeight, 2,
-               &retHeight, false);
-  // pm10
-  sprintf(buffer, "%d  \n", aqi->pm10);
-  writePartial(buffer, x + xLableOffset, y += space + retHeight, 2,
-               &retHeight, false);
+  display.setPartialWindow(x + xLableOffset, y, 70,
+                           (8 * 2 * 3) + (space * 2));
+  display.firstPage();
+  do {
+    display.fillRect(x + xLableOffset, y, 70, (8 * 2 * 3) + (space * 2),
+                     GxEPD_WHITE);
+    drawLabelText(aqi->AQIToString().c_str(), x + xLableOffset, y, 2,
+                  &retHeight);
+    // pm2
+    sprintf(buffer, "%d", aqi->pm2_5);
+    drawLabelText(buffer, x + xLableOffset, y + retHeight + space, 2,
+                  &retHeight);
+    // pm10
+    sprintf(buffer, "%d", aqi->pm10);
+    drawLabelText(buffer, x + xLableOffset, y + (retHeight * 2) + (space * 2),
+                  2, &retHeight);
+  } while (display.nextPage());
 }
 
 void drawCo2Values(Point point, uint16_t width, uint16_t height, uint16_t co2) {
@@ -427,27 +454,28 @@ void drawCo2Values(Point point, uint16_t width, uint16_t height, uint16_t co2) {
   int y = point.y;
 
   const int range = 3000;
+  const uint8_t iconSize = 16;
   double resolution = range / width;
 
   if (labelIcon) {
     const int xLableOffset = 75;
-    drawImage(CO2, x + xLableOffset, y, 16);
+    drawImage(CO2, x + xLableOffset, y, iconSize);
     // dati raccolti online
     uint excelentX = x;
     uint goodX = x + (800 / (int)resolution);
     uint fairX = x + (1000 / (int)resolution);
     uint sleepyX = x + (1400 / (int)resolution);
     uint badX = x + (1800 / (int)resolution);
-    uint8_t offsetFaceState = 25 + height;
-    drawImage(FACE_EXCELLENT, excelentX, y + offsetFaceState, 16);
-    drawImage(FACE_GOOD, goodX, y + offsetFaceState, 16);
-    drawImage(FACE_FAIR, fairX, y + offsetFaceState, 16);
-    drawImage(FACE_SLEEPY, sleepyX, y + offsetFaceState, 16);
-    drawImage(FACE_BAD, badX, y + offsetFaceState, 16);
+    uint8_t offsetFaceState = 26 + height;
+    drawImage(FACE_EXCELLENT, excelentX, y + offsetFaceState, iconSize);
+    drawImage(FACE_GOOD, goodX, y + offsetFaceState, iconSize);
+    drawImage(FACE_FAIR, fairX, y + offsetFaceState, iconSize);
+    drawImage(FACE_SLEEPY, sleepyX, y + offsetFaceState, iconSize);
+    drawImage(FACE_BAD, badX, y + offsetFaceState, iconSize);
     return;
   }
   char buffer[6];
-  uint8_t retHeight;
+  uint16_t retHeight;
   sprintf(buffer, "%05d\n", co2);
   // metto gli spazi al posto dei leading zeros
   for (size_t i = 0; i < strlen(buffer); i++) {
@@ -457,18 +485,26 @@ void drawCo2Values(Point point, uint16_t width, uint16_t height, uint16_t co2) {
       break;
   }
 
-  writePartial(buffer, x, y, 2, &retHeight, false);
-  y += retHeight + 3;
-  co2 = co2 > range ? range : co2;
-  int co2Width = co2 / (int)resolution;
+  int16_t x1, y1;
+  uint16_t w, h;
+  display.setFont(nullptr);
+  display.setTextSize(2);
+  display.getTextBounds(buffer, x, y, &x1, &y1, &w, &h);
+  retHeight = h;
 
-  display.setPartialWindow(x, y, width, height);
+  int textY = y;
+  int barY = y + iconSize + 4;
+  int windowTop = textY < y ? textY : y;
+  int windowH = (barY - windowTop) + height;
+  display.setPartialWindow(x, windowTop, width, windowH);
   display.firstPage();
   do {
-    display.fillRect(x, y, width, height, GxEPD_WHITE);
-    display.drawRect(x, y, width, height, GxEPD_BLACK);
-    display.fillRect(x, y, co2Width, height, GxEPD_BLACK);
-    ;
+    display.fillRect(x, windowTop, width, windowH, GxEPD_WHITE);
+    drawLabelText(buffer, x, textY, 2, &retHeight);
+    co2 = co2 > range ? range : co2;
+    int co2Width = co2 / (int)resolution;
+    display.drawRect(x, barY, width, height, GxEPD_BLACK);
+    display.fillRect(x, barY, co2Width, height, GxEPD_BLACK);
   } while (display.nextPage());
 }
 
@@ -630,7 +666,30 @@ void updateTime() {
     char buffer[6];
     sprintf(buffer, "%02d:%02d\n", timeClient.getHours(),
             timeClient.getMinutes());
-    writePartial(buffer, timePoint.x, timePoint.y, 2, nullptr, false);
+    int16_t x1, y1;
+    uint16_t w, h;
+    display.setFont(nullptr);
+    display.setTextSize(2);
+    display.getTextBounds(buffer, timePoint.x, timePoint.y, &x1, &y1, &w, &h);
+    int16_t rectX = x1 - 1;
+    int16_t rectY = y1 - 1;
+    uint16_t rectW = w + 2;
+    uint16_t rectH = h + 2;
+    if (rectX < 0) {
+      rectW = rectW + rectX;
+      rectX = 0;
+    }
+    if (rectY < 0) {
+      rectH = rectH + rectY;
+      rectY = 0;
+    }
+    display.setPartialWindow(rectX, rectY, rectW, rectH);
+    display.firstPage();
+    do {
+      display.fillRect(rectX, rectY, rectW, rectH, GxEPD_WHITE);
+      display.setCursor(timePoint.x, timePoint.y);
+      display.print(buffer);
+    } while (display.nextPage());
   }
 }
 
@@ -682,7 +741,7 @@ void updateSensorValues() {
     float shtTemp, shtHum;
     sht.measureHighPrecision(shtTemp, shtHum);
     drawTempAndHumidValues(sensorPoint, shtTemp, (int)shtHum);
-    drawCo2Values(co2ValuesPoint, display.width() - (10 * 2), 15,
+    drawCo2Values(co2ValuesPoint, display.width() - (10 * 2), 18,
                   airSensor.getCO2());
   }
 }
