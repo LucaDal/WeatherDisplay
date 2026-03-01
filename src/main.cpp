@@ -14,17 +14,14 @@
 #include "EEPROM.h"
 #include "Icons.h"
 #include "LiteWiFiManager.h"
+#include "MQTTManager.h"
 #include "MyDeviceProperties.h"
 #include "SHTSensor.h"
 #include "SparkFun_SCD30_Arduino_Library.h" //Click here to get the library: http://librarymanager/All#SparkFun_SCD30
 #include "WeatherAPI.h"
-#include "cert.h"
 #include "icons/IconPack.h"
-#include "secret_data.h"
 #include <NTPClient.h>
-#include <PubSubClient.h>
 #include <SimpleOTA.h>
-#include <WiFiClientSecure.h>
 #include <WiFiUdp.h>
 #include <memory>
 
@@ -36,11 +33,10 @@ const uint8_t FORECAST_SLOTS = 4;
 const unsigned long REFRESH_TIME_AQI = 3600; // un'ora - seconds
 bool debug = false;
 
-MyDeviceProperties deviceProperties(EEPROM_SIZE, 0, 3, 1024, true);
-DeviceSetupManager setupMgr(EEPROM_SIZE, 3);
-LiteWiFiManager wifiProvision;
 SimpleOTA simpleOTA;
-const char *DEVICE_ID;
+MyDeviceProperties devProps;
+LiteWiFiManager wifiProvision;
+DeviceSetupManager setupMgr;
 
 SCD30 airSensor;
 SensirionI2cSht4x sht;
@@ -74,8 +70,7 @@ NTPClient timeClient(udpClient, 7200);
 
 uint8_t currForecastIdx = 0;
 
-WiFiClientSecure esp_client;
-PubSubClient mqtt_client(esp_client);
+MQTTManager mqttManager;
 
 struct TermoIgro {
   double temp = 0;
@@ -147,12 +142,12 @@ void writePartial(String text, uint16_t x, uint16_t y, uint8_t textSize,
     }
   }
   if (!cacheHit) {
-    cache[cacheNext] = {x, y, textSize, useFont, (uint16_t)clearWidth,
-                        (uint16_t)clearHeight, true};
+    cache[cacheNext] = {
+        x,   y, textSize, useFont, (uint16_t)clearWidth, (uint16_t)clearHeight,
+        true};
     cacheNext = (cacheNext + 1) % (sizeof(cache) / sizeof(cache[0]));
   }
-  display.setPartialWindow(x, y, (uint16_t)clearWidth,
-                           (uint16_t)clearHeight);
+  display.setPartialWindow(x, y, (uint16_t)clearWidth, (uint16_t)clearHeight);
   display.firstPage();
   do {
     display.fillRect(x, y, (uint16_t)clearWidth, (uint16_t)clearHeight,
@@ -282,19 +277,16 @@ void drawStaticLayout() {
 }
 
 void connectToMQTT() {
-  JsonDocument &doc = deviceProperties.json();
-  const char *mqtt_topic = doc["topic_igrometro"] | "";
-  const char *mqtt_password = doc["password"] | "";
-  const char *mqtt_username = doc["username"] | "";
+  const char *mqtt_topic = devProps.Get("topic");
   String client_id = "esp32-client-" + String(WiFi.macAddress());
-  LOGF("Connecting to MQTT Broker as %s...\n", client_id.c_str());
-  LOGF("topic: [%s], pw:  [%s], user: [%s]\n", mqtt_topic, mqtt_password,
-       mqtt_username);
-  if (mqtt_client.connect(client_id.c_str(), mqtt_username, mqtt_password)) {
+  LOGF("Connecting to MQTT Broker with client cert as %s...\n",
+       client_id.c_str());
+  LOGF("topic: [%s]\n", mqtt_topic);
+  if (mqttManager.connect(client_id.c_str())) {
     LOG("Connected to MQTT broker");
-    mqtt_client.subscribe(mqtt_topic);
+    mqttManager.subscribe(mqtt_topic);
   } else {
-    LOGF("Failed to connect to MQTT broker, rc=%d\n", mqtt_client.state());
+    LOGF("Failed to connect to MQTT broker, rc=%d\n", mqttManager.state());
     delay(5000);
   }
 }
@@ -340,8 +332,7 @@ void drawHourForecast(uint8_t startIndex, Point point) {
     display.setPartialWindow(textX, textY, columnWidth - 15, textBlockH);
     display.firstPage();
     do {
-      display.fillRect(textX, textY, columnWidth - 15, textBlockH,
-                       GxEPD_WHITE);
+      display.fillRect(textX, textY, columnWidth - 15, textBlockH, GxEPD_WHITE);
       // temp
       sprintf(buffer, "%.1f", forecasts[i].temp);
       drawLabelText(buffer, textX, textY, fontSize);
@@ -350,8 +341,8 @@ void drawHourForecast(uint8_t startIndex, Point point) {
       drawLabelText(buffer, textX, textY + lineHeight + spacing, fontSize);
       // humid
       sprintf(buffer, "%02d", forecasts[i].humidity);
-      drawLabelText(buffer, textX,
-                    textY + (lineHeight + spacing) * 2, fontSize);
+      drawLabelText(buffer, textX, textY + (lineHeight + spacing) * 2,
+                    fontSize);
     } while (display.nextPage());
     // hour
     uint8_t oldRot = display.getRotation();
@@ -430,8 +421,7 @@ void drawAirQuality(AirQuality *aqi, Point point) {
   }
   if (aqi == nullptr)
     return;
-  display.setPartialWindow(x + xLableOffset, y, 70,
-                           (8 * 2 * 3) + (space * 2));
+  display.setPartialWindow(x + xLableOffset, y, 70, (8 * 2 * 3) + (space * 2));
   display.firstPage();
   do {
     display.fillRect(x + xLableOffset, y, 70, (8 * 2 * 3) + (space * 2),
@@ -704,29 +694,49 @@ void setup() {
   wifiProvision.begin("Weather Display");
   size_t nextOffset = 0;
   // setup device salvato in precedenza
-  setupMgr.begin();
+  if (!setupMgr.begin()) {
+    LOG("DeviceSetupManager begin failed\n");
+    return;
+  }
 
-  DEVICE_ID = setupMgr.readCString(0, &nextOffset);
-  deviceProperties.begin(PORTAL_SERVER_IP, DEVICE_ID, nextOffset);
-  drawCenteredStatus("Ricerca aggiornamento...");
-  deviceProperties.fetchAndStoreIfChanged();
-  simpleOTA.begin(EEPROM_SIZE, PORTAL_SERVER_IP, DEVICE_ID, true);
+  if (strlen(setupMgr.deviceId()) == 0) {
+    LOG("Device ID not settled. please provide one.\n");
+  }
+  if (strlen(setupMgr.deviceSecret()) == 0) {
+    LOG("Device secret not settled. please provide one.\n");
+  }
+  if (strlen(setupMgr.deviceTypeId()) == 0) {
+    LOG("Device type ID not settled. please provide one.\n");
+  }
+  if (strlen(setupMgr.portalServerIp()) == 0) {
+    LOG("Portal server IP not settled. please provide one.\n");
+  }
+
+  if (WiFi.status() == WL_CONNECTED && strlen(setupMgr.deviceId()) > 0 &&
+      strlen(setupMgr.deviceSecret()) > 0 &&
+      strlen(setupMgr.deviceTypeId()) > 0 &&
+      strlen(setupMgr.portalServerIp()) > 0) {
+    drawCenteredStatus("Ricerca aggiornamento...");
+    devProps.begin(setupMgr.portalServerIp(), setupMgr.deviceId(),
+                   setupMgr.deviceSecret());
+    devProps.fetchAndStoreIfChanged();
+    simpleOTA.begin(setupMgr.portalServerIp(), setupMgr.deviceTypeId(),
+                    setupMgr.deviceId(), setupMgr.deviceSecret(), true);
+  }
   timeClient.begin();
-
-  JsonDocument &doc = deviceProperties.json();
-  const char *lat = doc["latitude"] | "";
-  const char *lon = doc["longitude"] | "";
-  LOGF("lat: %s, lon %s\n", lat, lon);
-  weather.reset(new WeatherAPI(WEATHER_API_KEY, lat, lon));
+  weather.reset(new WeatherAPI(devProps.Get("WEATHER_API_KEY"),
+                               devProps.Get("latitude"),
+                               devProps.Get("longitude")));
   // sincronizzo ogni 60 minuti
   timeClient.setUpdateInterval(36e5); // 60 minuti
 
-  esp_client.setCACert(ssl_ca_cert);
-  esp_client.setInsecure();
-  mqtt_client.setServer(MQTT_BROKER, MQTT_PORT);
-  mqtt_client.setKeepAlive(60);
-  mqtt_client.setCallback(mqttCallback);
-  connectToMQTT();
+  if (mqttManager.begin(devProps.Get("MQTT_BROKER"),
+                        devProps.GetInt("MQTT_PORT", 8883),
+                        mqttCallback)) {
+    connectToMQTT();
+  } else {
+    LOG("MQTT manager init failed\n");
+  }
 
   setPoints();
   clearScreen();
@@ -763,9 +773,9 @@ void loop() {
   updateSensorValues();
   updateAirPollution();
   updateForecast();
-  if (!mqtt_client.connected())
+  if (!mqttManager.connected())
     connectToMQTT();
-  mqtt_client.loop();
+  mqttManager.loop();
   updateExternalTemperature();
   // display.hibernate();
 }
