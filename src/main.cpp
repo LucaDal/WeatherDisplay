@@ -70,7 +70,7 @@ NTPClient timeClient(udpClient, 7200);
 
 uint8_t currForecastIdx = 0;
 
-MQTTManager mqttManager;
+MQTTManager mqttClient;
 
 struct TermoIgro {
   double temp = 0;
@@ -278,15 +278,15 @@ void drawStaticLayout() {
 
 void connectToMQTT() {
   const char *mqtt_topic = devProps.Get("topic");
-  String client_id = "esp32-client-" + String(WiFi.macAddress());
+  String client_id = setupMgr.deviceId();
   LOGF("Connecting to MQTT Broker with client cert as %s...\n",
        client_id.c_str());
   LOGF("topic: [%s]\n", mqtt_topic);
-  if (mqttManager.connect(client_id.c_str())) {
+  if (mqttClient.connect(client_id.c_str())) {
     LOG("Connected to MQTT broker");
-    mqttManager.subscribe(mqtt_topic);
+    mqttClient.subscribe(mqtt_topic);
   } else {
-    LOGF("Failed to connect to MQTT broker, rc=%d\n", mqttManager.state());
+    LOGF("Failed to connect to MQTT broker, rc=%d\n", mqttClient.state());
     delay(5000);
   }
 }
@@ -699,30 +699,15 @@ void setup() {
     return;
   }
 
-  if (strlen(setupMgr.deviceId()) == 0) {
-    LOG("Device ID not settled. please provide one.\n");
-  }
-  if (strlen(setupMgr.deviceSecret()) == 0) {
-    LOG("Device secret not settled. please provide one.\n");
-  }
-  if (strlen(setupMgr.deviceTypeId()) == 0) {
-    LOG("Device type ID not settled. please provide one.\n");
-  }
-  if (strlen(setupMgr.portalServerIp()) == 0) {
-    LOG("Portal server IP not settled. please provide one.\n");
-  }
-
-  if (WiFi.status() == WL_CONNECTED && strlen(setupMgr.deviceId()) > 0 &&
-      strlen(setupMgr.deviceSecret()) > 0 &&
-      strlen(setupMgr.deviceTypeId()) > 0 &&
-      strlen(setupMgr.portalServerIp()) > 0) {
-    drawCenteredStatus("Ricerca aggiornamento...");
+  drawCenteredStatus("Ricerca aggiornamento...");
+  if (setupMgr.isProvisioningReady()) {
     devProps.begin(setupMgr.portalServerIp(), setupMgr.deviceId(),
-                   setupMgr.deviceSecret());
+                           setupMgr.deviceSecret());
     devProps.fetchAndStoreIfChanged();
     simpleOTA.begin(setupMgr.portalServerIp(), setupMgr.deviceTypeId(),
                     setupMgr.deviceId(), setupMgr.deviceSecret(), true);
   }
+
   timeClient.begin();
   weather.reset(new WeatherAPI(devProps.Get("WEATHER_API_KEY"),
                                devProps.Get("latitude"),
@@ -730,7 +715,7 @@ void setup() {
   // sincronizzo ogni 60 minuti
   timeClient.setUpdateInterval(36e5); // 60 minuti
 
-  if (mqttManager.begin(devProps.Get("MQTT_BROKER"),
+  if (mqttClient.begin(devProps.Get("MQTT_BROKER"),
                         devProps.GetInt("MQTT_PORT", 8883),
                         mqttCallback)) {
     connectToMQTT();
@@ -773,9 +758,9 @@ void loop() {
   updateSensorValues();
   updateAirPollution();
   updateForecast();
-  if (!mqttManager.connected())
+  if (!mqttClient.connected())
     connectToMQTT();
-  mqttManager.loop();
+  mqttClient.loop();
   updateExternalTemperature();
   // display.hibernate();
 }
