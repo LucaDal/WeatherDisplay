@@ -1,766 +1,387 @@
 #include <Arduino.h>
 
 #include <ArduinoJson.h>
-#include <Fonts/FreeSans12pt7b.h>
-#include <Fonts/FreeSans18pt7b.h>
-#include <Fonts/FreeSans9pt7b.h>
-#include <GxEPD2_3C.h>
-#include <GxEPD2_BW.h>
 #include <SensirionI2cSht4x.h>
 #include <Wire.h>
 
 #include "CommonDebug.h"
 #include "DeviceSetupManager.h"
-#include "EEPROM.h"
-#include "Icons.h"
 #include "LiteWiFiManager.h"
 #include "MQTTManager.h"
 #include "MyDeviceProperties.h"
-#include "SHTSensor.h"
 #include "SparkFun_SCD30_Arduino_Library.h" //Click here to get the library: http://librarymanager/All#SparkFun_SCD30
+#include "TimeSyncManager.h"
 #include "WeatherAPI.h"
-#include "icons/IconPack.h"
-#include <NTPClient.h>
+#include "WeatherDisplayUi.h"
 #include <SimpleOTA.h>
-#include <WiFiUdp.h>
+#include <ctime>
 #include <memory>
 
-const int MQTT_PORT = 8883;
-const int EEPROM_SIZE = 4096;
+const uint16_t MQTT_PORT = 8883;
 const uint8_t FORECAST_SLOTS = 4;
 #define LOG(msg) DBG_LOG("", msg)
 #define LOGF(fmt, ...) DBG_LOGF("", fmt, ##__VA_ARGS__)
-const unsigned long REFRESH_TIME_AQI = 3600; // un'ora - seconds
+const unsigned long REFRESH_TIME_AQI_MS = 60UL * 60UL * 1000UL;
+// Sensor values are sampled more often than they are drawn. Temperature and
+// humidity use the last valid sample, while CO2 is averaged over the minute.
+const unsigned long SENSOR_SAMPLE_INTERVAL_MS = 10UL * 1000UL;
+const unsigned long SENSOR_DISPLAY_INTERVAL_MS = 60UL * 1000UL;
+const unsigned long SCREEN_TIME_INTERVAL_MS = 60UL * 1000UL;
+// The e-paper panel is powered off shortly after each refresh. The framebuffer
+// content remains visible and the next partial refresh wakes the panel.
+const unsigned long DISPLAY_POWER_OFF_IDLE_MS = 10UL * 1000UL;
+const time_t EXT_SENSOR_TIMEOUT_SEC = 20UL * 60UL;
 bool debug = false;
 
 SimpleOTA simpleOTA;
 MyDeviceProperties devProps;
 LiteWiFiManager wifiProvision;
 DeviceSetupManager setupMgr;
+TimeSyncManager timeMgr;
 
 SCD30 airSensor;
 SensirionI2cSht4x sht;
 
-GxEPD2_BW<GxEPD2_420_GDEY042T81, GxEPD2_420_GDEY042T81::HEIGHT>
-    display(GxEPD2_420_GDEY042T81(/*CS=5*/ SS, /*DC=*/3, /*RES=*/2,
-                                  /*BUSY=*/1)); // 400x300, SSD1683
+WeatherPanel display(GxEPD2_420_GDEY042T81(/*CS=5*/ SS, /*DC=*/3, /*RES=*/2,
+                                           /*BUSY=*/1)); // 400x300, SSD1683
+WeatherDisplayUi ui(display);
 // API key, latitude and longitude
 std::unique_ptr<WeatherAPI> weather;
 
-unsigned long nextAirRequest = 0;
-unsigned long nextSensorRequest = 0;
-unsigned long nextScreenTimeUpdate = 0;
-// usato per caricare icone in setup
-bool labelIcon = false;
+unsigned long nowMs = 0;
+time_t nowEpoch = 0;
+unsigned long lastAirUpdateMs = 0;
+unsigned long lastSensorSampleMs = 0;
+unsigned long lastSensorDisplayMs = 0;
+unsigned long lastScreenTimeUpdateMs = 0;
+double lastSensorTemp = 0.0;
+double lastSensorHumid = 0.0;
+uint32_t sensorCo2Sum = 0;
+uint16_t sensorSamples = 0;
+uint16_t lastDisplayedCo2 = 0;
+bool hasDisplayedCo2 = false;
 Forecast *forecasts = nullptr;
 size_t forecastsCount = 0;
 
-struct Point {
-  int x;
-  int y;
-} sensorPoint, forecastPoint, pollutionPoint, extTermIgroPoint, co2ValuesPoint,
-    timePoint;
-
-void drawTempAndHumidValues(Point point, double temp, int humid);
-void drawCo2Values(Point point, uint16_t width, uint16_t height, uint16_t co2);
-void drawHourForecast(uint8_t startIndex, Point point);
-
-WiFiUDP udpClient;
-NTPClient timeClient(udpClient, 7200);
+DisplayPoint sensorPoint, forecastPoint, pollutionPoint, extTermIgroPoint,
+    co2ValuesPoint, timePoint;
 
 uint8_t currForecastIdx = 0;
 
 MQTTManager mqttClient;
 
 struct TermoIgro {
-  double temp = 0;
-  uint8_t humid = 0;
-  uint32_t dt = 0;
+    double temp = 0;
+    uint8_t humid = 0;
+    time_t dt = 0;
 } extTermIgro;
 bool extAcquired;
 
-void writePartial(String text, uint16_t x, uint16_t y, uint8_t textSize,
-                  uint8_t *retHeight = nullptr, bool useFont = true) {
-  const uint8_t x_offset = 0;
-  const uint8_t y_offset = 3;
-  int16_t x1, y1;
-  uint16_t width, height;
-  struct PartialCache {
-    uint16_t x;
-    uint16_t y;
-    uint8_t textSize;
-    bool useFont;
-    uint16_t width;
-    uint16_t height;
-    bool used;
-  };
-  static PartialCache cache[16] = {};
-  static uint8_t cacheNext = 0;
+void updateLoopClock() {
+    nowMs = millis();
+    nowEpoch = time(nullptr);
+}
 
-  if (useFont) {
-    switch (textSize) {
-    case 9:
-      display.setFont(&FreeSans9pt7b);
-      break;
-    case 12:
-      display.setFont(&FreeSans12pt7b);
-      break;
-    case 18:
-      display.setFont(&FreeSans18pt7b);
-      break;
-    default:
-      display.setFont(nullptr);
+bool intervalElapsed(unsigned long &lastUpdateMs, unsigned long intervalMs) {
+    if (lastUpdateMs == 0 || nowMs - lastUpdateMs >= intervalMs) {
+        lastUpdateMs = nowMs;
+        return true;
     }
-  } else {
-    display.setFont(nullptr);
-    display.setTextSize(textSize);
-  }
-  // display.setTextSize(textSize);
-  display.getTextBounds(text, x, y, &x1, &y1, &width, &height);
-  if (retHeight != nullptr)
-    *retHeight = height;
-  int16_t clearWidth = (int16_t)width + x_offset + 2;
-  int16_t clearHeight = (int16_t)height + y_offset + 2;
-  if (clearWidth < 0)
-    clearWidth = 0;
-  if (clearHeight < 0)
-    clearHeight = 0;
-  bool cacheHit = false;
-  for (size_t i = 0; i < (sizeof(cache) / sizeof(cache[0])); i++) {
-    if (!cache[i].used)
-      continue;
-    if (cache[i].x == x && cache[i].y == y && cache[i].textSize == textSize &&
-        cache[i].useFont == useFont) {
-      if (cache[i].width > (uint16_t)clearWidth)
-        clearWidth = cache[i].width;
-      if (cache[i].height > (uint16_t)clearHeight)
-        clearHeight = cache[i].height;
-      cache[i].width = clearWidth;
-      cache[i].height = clearHeight;
-      cacheHit = true;
-      break;
-    }
-  }
-  if (!cacheHit) {
-    cache[cacheNext] = {
-        x,   y, textSize, useFont, (uint16_t)clearWidth, (uint16_t)clearHeight,
-        true};
-    cacheNext = (cacheNext + 1) % (sizeof(cache) / sizeof(cache[0]));
-  }
-  display.setPartialWindow(x, y, (uint16_t)clearWidth, (uint16_t)clearHeight);
-  display.firstPage();
-  do {
-    display.fillRect(x, y, (uint16_t)clearWidth, (uint16_t)clearHeight,
-                     GxEPD_WHITE);
-    uint8_t offset = 0;
-    if (useFont)
-      offset = height;
-    display.setCursor(x, y + offset);
-    display.println(text);
-  } while (display.nextPage());
+    return false;
 }
 
-void drawImage(const uint8_t *image, size_t x, size_t y, size_t iconSize = 64) {
-  display.drawImage(image, x, y, iconSize, iconSize, false, false);
-}
-
-void initDisplay() {
-  display.init(115200, true, 50, false);
-  display.setRotation(4);
-  display.setTextColor(GxEPD_BLACK);
-  display.setTextWrap(false);
-}
-
-void clearScreen() {
-  display.setFullWindow();
-  display.firstPage();
-  do {
-    display.fillScreen(GxEPD_WHITE);
-  } while (display.nextPage());
-}
-
-void drawCenteredStatus(const char *text) {
-  int16_t x1, y1;
-  uint16_t width, height;
-  display.setFont(&FreeSans12pt7b);
-  display.getTextBounds(text, 0, 0, &x1, &y1, &width, &height);
-  int16_t x = (display.width() - width) / 2 - x1;
-  int16_t y = (display.height() - height) / 2 - y1;
-  display.setFullWindow();
-  display.firstPage();
-  do {
-    display.fillScreen(GxEPD_WHITE);
-    display.setCursor(x, y);
-    display.print(text);
-  } while (display.nextPage());
-}
-
-void drawLabelText(const char *text, int16_t x, int16_t y, uint8_t textSize,
-                   uint16_t *retHeight = nullptr) {
-  int16_t x1, y1;
-  uint16_t width, height;
-  display.setFont(nullptr);
-  display.setTextSize(textSize);
-  display.getTextBounds(text, x, y, &x1, &y1, &width, &height);
-  if (retHeight != nullptr)
-    *retHeight = height;
-  display.setCursor(x, y);
-  display.print(text);
-}
-
-void drawLabelTextCleared(const char *text, int16_t x, int16_t y,
-                          uint8_t textSize, uint16_t *retHeight = nullptr) {
-  int16_t x1, y1;
-  uint16_t width, height;
-  display.setFont(nullptr);
-  display.setTextSize(textSize);
-  display.getTextBounds(text, x, y, &x1, &y1, &width, &height);
-  if (retHeight != nullptr)
-    *retHeight = height;
-  int16_t rx = x1 - 1;
-  int16_t ry = y1 - 1;
-  int16_t rw = (int16_t)width + 2;
-  int16_t rh = (int16_t)height + 2;
-  if (rx < 0) {
-    rw = rw + rx;
-    rx = 0;
-  }
-  if (ry < 0) {
-    rh = rh + ry;
-    ry = 0;
-  }
-  if (rw < 0)
-    rw = 0;
-  if (rh < 0)
-    rh = 0;
-  display.fillRect(rx, ry, (uint16_t)rw, (uint16_t)rh, GxEPD_WHITE);
-  display.setCursor(x, y);
-  display.print(text);
-}
-
-void drawAirQualityLabels(Point point) {
-  const uint8_t space = 5;
-  uint16_t x = point.x;
-  uint16_t y = point.y;
-  uint16_t retHeight = 0;
-
-  drawLabelText("AQI", x, y, 2, &retHeight);
-  y += space + retHeight;
-  drawLabelText("pm2", x, y, 2, &retHeight);
-  y += space + retHeight;
-  drawLabelText("pm10", x, y, 2, &retHeight);
-}
-
-void drawForecastContextIcons(int16_t x, int16_t y, uint8_t iconSize,
-                              uint8_t spacing, uint8_t contextIconOff) {
-  y += iconSize;
-  drawImage(THERMOMETER, x - contextIconOff, y += spacing, 16);
-  drawImage(HUMAN, x - contextIconOff, y += 16 + spacing, 16);
-  drawImage(HUMIDITY, x - contextIconOff, y += 16 + spacing, 16);
-}
-
-void drawStaticLayout() {
-  labelIcon = true;
-  display.setFullWindow();
-  display.firstPage();
-  do {
-    display.fillScreen(GxEPD_WHITE);
-    drawLabelText("int", 50, 2, 1);
-    drawLabelText("ext", 250, 2, 1);
-    drawTempAndHumidValues(sensorPoint, 0.0, 0);
-    drawCo2Values(co2ValuesPoint, display.width() - (10 * 2), 10, 0);
-    drawAirQualityLabels(pollutionPoint);
-    drawHourForecast(0, forecastPoint);
-    drawTempAndHumidValues(extTermIgroPoint, -200, -100);
-  } while (display.nextPage());
-  labelIcon = false;
+void resetSensorSamples() {
+    sensorCo2Sum = 0;
+    sensorSamples = 0;
 }
 
 void connectToMQTT() {
-  const char *mqtt_topic = devProps.Get("topic");
-  String client_id = setupMgr.deviceId();
-  LOGF("Connecting to MQTT Broker with client cert as %s...\n",
-       client_id.c_str());
-  LOGF("topic: [%s]\n", mqtt_topic);
-  if (mqttClient.connect(client_id.c_str())) {
-    LOG("Connected to MQTT broker");
-    mqttClient.subscribe(mqtt_topic);
-  } else {
-    LOGF("Failed to connect to MQTT broker, rc=%d\n", mqttClient.state());
-    delay(5000);
-  }
-}
-
-void drawHourForecast(uint8_t startIndex, Point point) {
-  const uint8_t iconSize = 64;
-  const uint8_t spacing = 5;
-  // used for hour
-  const uint8_t hourVerticalSpace = point.y + 18;
-  const uint8_t fontSize = 2;
-  const uint8_t contextIconOff = 15;
-  const uint8_t columnWidth = 102;
-  int x;
-  int y;
-  if (labelIcon) {
-    for (size_t i = 0; i < FORECAST_SLOTS; i++) {
-      x = point.x + (i * columnWidth);
-      drawForecastContextIcons(x, point.y, iconSize, spacing, contextIconOff);
+    const char *mqtt_topic = devProps.Get("topic");
+    String client_id = setupMgr.deviceId();
+    LOGF("Connecting to MQTT Broker with client cert as %s...\n",
+         client_id.c_str());
+    LOGF("topic: [%s]\n", mqtt_topic);
+    if (mqttClient.connect(client_id.c_str())) {
+        LOG("Connected to MQTT broker");
+        mqttClient.subscribe(mqtt_topic);
+    } else {
+        LOGF("Failed to connect to MQTT broker, rc=%d\n", mqttClient.state());
+        delay(5000);
     }
-    return;
-  }
-  if (forecasts == nullptr || forecastsCount == 0 ||
-      startIndex >= forecastsCount)
-    return;
-  size_t end = startIndex + FORECAST_SLOTS;
-  if (end > forecastsCount)
-    end = forecastsCount;
-  for (size_t i = startIndex; i < end; i++) {
-    size_t column = i - startIndex;
-    x = point.x + (column * columnWidth);
-
-    y = point.y;
-
-    char buffer[10];
-
-    drawImage(forecasts[i].icon, x, y);
-    x += 15;
-    y += iconSize;
-    int textX = x;
-    int textY = y + spacing;
-    int lineHeight = 8 * fontSize;
-    int textBlockH = (lineHeight * 3) + (spacing * 2);
-    display.setPartialWindow(textX, textY, columnWidth - 15, textBlockH);
-    display.firstPage();
-    do {
-      display.fillRect(textX, textY, columnWidth - 15, textBlockH, GxEPD_WHITE);
-      // temp
-      sprintf(buffer, "%.1f", forecasts[i].temp);
-      drawLabelText(buffer, textX, textY, fontSize);
-      // percived temp
-      sprintf(buffer, "%.1f", forecasts[i].percivedTemp);
-      drawLabelText(buffer, textX, textY + lineHeight + spacing, fontSize);
-      // humid
-      sprintf(buffer, "%02d", forecasts[i].humidity);
-      drawLabelText(buffer, textX, textY + (lineHeight + spacing) * 2,
-                    fontSize);
-    } while (display.nextPage());
-    // hour
-    uint8_t oldRot = display.getRotation();
-    display.setRotation(1);
-    sprintf(buffer, "%02d:%02d\n", forecasts[i].timeStamp.hour,
-            forecasts[i].timeStamp.minute);
-    writePartial((String)buffer, hourVerticalSpace,
-                 display.height() - (x - spacing - 20), fontSize - 1, nullptr,
-                 false);
-    LOG(buffer);
-    display.setRotation(oldRot);
-  }
-}
-
-void drawTempAndHumidValues(Point point, double temp, int humid) {
-  char buffer[10];
-  uint16_t retHeight = 0;
-  const uint8_t spacing = 10;
-  const uint8_t fontSize = 4;
-  const uint8_t xLableOffset = 105;
-  const uint8_t yLableOffset = 5;
-  uint16_t x = point.x;
-  uint16_t y = point.y;
-
-  if (labelIcon) {
-    drawImage(THERMOMETER, x + xLableOffset, y + yLableOffset, 16);
-    drawImage(HUMIDITY, x + xLableOffset, y += 32 + spacing + yLableOffset, 16);
-  } else {
-    char tempBuf[8];
-    char humidBuf[8];
-    if (temp > -100)
-      sprintf(tempBuf, "%02.1f", temp);
-    else
-      snprintf(tempBuf, sizeof(tempBuf), "----");
-    if (humid > -1)
-      sprintf(humidBuf, "%02d", humid);
-    else
-      snprintf(humidBuf, sizeof(humidBuf), "----");
-
-    int16_t x1, y1;
-    uint16_t w, h;
-    display.setFont(nullptr);
-    display.setTextSize(fontSize);
-    display.getTextBounds(tempBuf, x, y, &x1, &y1, &w, &h);
-    uint16_t maxW = w;
-    uint16_t lineH = h;
-    display.getTextBounds(humidBuf, x, y, &x1, &y1, &w, &h);
-    if (w > maxW)
-      maxW = w;
-    if (h > lineH)
-      lineH = h;
-    uint16_t windowW = maxW + 2;
-    uint16_t windowH = (lineH * 2) + spacing + 2;
-
-    display.setPartialWindow(x, y, windowW, windowH);
-    display.firstPage();
-    do {
-      display.fillRect(x, y, windowW, windowH, GxEPD_WHITE);
-      drawLabelText(tempBuf, x, y, fontSize, &retHeight);
-      drawLabelText(humidBuf, x, y + lineH + spacing, fontSize, &retHeight);
-    } while (display.nextPage());
-  }
-}
-
-void drawAirQuality(AirQuality *aqi, Point point) {
-  uint16_t retHeight;
-  const uint8_t space = 5;
-  const uint8_t xLableOffset = 60;
-  uint16_t x = point.x;
-  uint16_t y = point.y;
-  char buffer[10];
-
-  if (labelIcon) {
-    drawAirQualityLabels(point);
-    return;
-  }
-  if (aqi == nullptr)
-    return;
-  display.setPartialWindow(x + xLableOffset, y, 70, (8 * 2 * 3) + (space * 2));
-  display.firstPage();
-  do {
-    display.fillRect(x + xLableOffset, y, 70, (8 * 2 * 3) + (space * 2),
-                     GxEPD_WHITE);
-    drawLabelText(aqi->AQIToString().c_str(), x + xLableOffset, y, 2,
-                  &retHeight);
-    // pm2
-    sprintf(buffer, "%d", aqi->pm2_5);
-    drawLabelText(buffer, x + xLableOffset, y + retHeight + space, 2,
-                  &retHeight);
-    // pm10
-    sprintf(buffer, "%d", aqi->pm10);
-    drawLabelText(buffer, x + xLableOffset, y + (retHeight * 2) + (space * 2),
-                  2, &retHeight);
-  } while (display.nextPage());
-}
-
-void drawCo2Values(Point point, uint16_t width, uint16_t height, uint16_t co2) {
-  int x = point.x;
-  int y = point.y;
-
-  const int range = 3000;
-  const uint8_t iconSize = 16;
-  double resolution = range / width;
-
-  if (labelIcon) {
-    const int xLableOffset = 75;
-    drawImage(CO2, x + xLableOffset, y, iconSize);
-    // dati raccolti online
-    uint excelentX = x;
-    uint goodX = x + (800 / (int)resolution);
-    uint fairX = x + (1000 / (int)resolution);
-    uint sleepyX = x + (1400 / (int)resolution);
-    uint badX = x + (1800 / (int)resolution);
-    uint8_t offsetFaceState = 26 + height;
-    drawImage(FACE_EXCELLENT, excelentX, y + offsetFaceState, iconSize);
-    drawImage(FACE_GOOD, goodX, y + offsetFaceState, iconSize);
-    drawImage(FACE_FAIR, fairX, y + offsetFaceState, iconSize);
-    drawImage(FACE_SLEEPY, sleepyX, y + offsetFaceState, iconSize);
-    drawImage(FACE_BAD, badX, y + offsetFaceState, iconSize);
-    return;
-  }
-  char buffer[6];
-  uint16_t retHeight;
-  sprintf(buffer, "%05d\n", co2);
-  // metto gli spazi al posto dei leading zeros
-  for (size_t i = 0; i < strlen(buffer); i++) {
-    if (buffer[i] == '0' && i < 4)
-      buffer[i] = ' ';
-    else
-      break;
-  }
-
-  int16_t x1, y1;
-  uint16_t w, h;
-  display.setFont(nullptr);
-  display.setTextSize(2);
-  display.getTextBounds(buffer, x, y, &x1, &y1, &w, &h);
-  retHeight = h;
-
-  int textY = y;
-  int barY = y + iconSize + 4;
-  int windowTop = textY < y ? textY : y;
-  int windowH = (barY - windowTop) + height;
-  display.setPartialWindow(x, windowTop, width, windowH);
-  display.firstPage();
-  do {
-    display.fillRect(x, windowTop, width, windowH, GxEPD_WHITE);
-    drawLabelText(buffer, x, textY, 2, &retHeight);
-    co2 = co2 > range ? range : co2;
-    int co2Width = co2 / (int)resolution;
-    display.drawRect(x, barY, width, height, GxEPD_BLACK);
-    display.fillRect(x, barY, co2Width, height, GxEPD_BLACK);
-  } while (display.nextPage());
 }
 
 void updateAirPollution() {
-  const unsigned long currTime = timeClient.getEpochTime();
-  LOGF("AirUpdate: %d, %d\n", currTime, nextAirRequest);
-  if (currTime >= nextAirRequest) {
-    nextAirRequest = currTime + REFRESH_TIME_AQI;
+    if (!intervalElapsed(lastAirUpdateMs, REFRESH_TIME_AQI_MS))
+        return;
+
+    LOGF("AirUpdate: epoch=%lu, lastMs=%lu\n", (unsigned long)nowEpoch,
+         lastAirUpdateMs);
     AirQuality *aqi = nullptr;
     if (debug) {
-      static AirQuality debugAqi;
-      debugAqi = AirQuality();
-      aqi = &debugAqi;
-    } else {
-      aqi = weather->GetAirPollution();
+        static AirQuality debugAqi;
+        debugAqi = AirQuality();
+        aqi = &debugAqi;
+    } else if (weather != nullptr) {
+        aqi = weather->GetAirPollution();
     }
     if (aqi != nullptr)
-      drawAirQuality(aqi, pollutionPoint);
-  }
+        ui.drawAirQuality(aqi, pollutionPoint);
 }
 
 /// @brief uso questa funzione poiche'
 /// a volte, dopo il refresh, parte dalla previsione di 3 ore dopo
 void getForecast() {
-  // min is 7, otherwise on update -> indexOutOfBounds
-  const size_t maxSize = 8;
-  size_t previousCount = forecastsCount;
-  Forecast *temp = nullptr;
-  if (forecasts != nullptr && previousCount > 0) {
-    temp = (Forecast *)malloc(sizeof(Forecast) * previousCount);
-    if (temp != nullptr)
-      memcpy(temp, forecasts, sizeof(Forecast) * previousCount);
-  }
-  forecasts = weather->GetForecast(maxSize);
-  forecastsCount = weather->GetForecastCount();
-  // primo avvio
-  if (forecasts == nullptr || forecastsCount == 0) {
-    if (temp != nullptr)
-      free(temp);
-    return;
-  }
-  unsigned long currTime = timeClient.getEpochTime();
-  size_t currentIdx = forecastsCount;
-  for (size_t i = 0; i < forecastsCount; i++) {
-    if (forecasts[i].timeStamp.getUnix() <= currTime)
-      currentIdx = i;
-  }
-
-  if (currentIdx == forecastsCount) {
-    if (temp != nullptr && previousCount > 0 &&
-        previousCount <= forecastsCount) {
-      memcpy(forecasts, temp, sizeof(Forecast) * previousCount);
-      forecastsCount = previousCount;
+    // min is 7, otherwise on update -> indexOutOfBounds
+    const size_t maxSize = 8;
+    size_t previousCount = forecastsCount;
+    Forecast *temp = nullptr;
+    if (forecasts != nullptr && previousCount > 0) {
+        temp = (Forecast *)malloc(sizeof(Forecast) * previousCount);
+        if (temp != nullptr)
+            memcpy(temp, forecasts, sizeof(Forecast) * previousCount);
     }
-    if (temp != nullptr)
-      free(temp);
-    return;
-  }
-
-  if (currentIdx > 0) {
-    size_t newCount = forecastsCount - currentIdx;
-    for (size_t i = 0; i < newCount; i++) {
-      forecasts[i] = forecasts[i + currentIdx];
+    forecasts = weather->GetForecast(maxSize);
+    forecastsCount = weather->GetForecastCount();
+    // primo avvio
+    if (forecasts == nullptr || forecastsCount == 0) {
+        if (temp != nullptr)
+            free(temp);
+        return;
     }
-    forecastsCount = newCount;
-  }
+    time_t currentEpoch = nowEpoch;
+    size_t currentIdx = forecastsCount;
+    for (size_t i = 0; i < forecastsCount; i++) {
+        if (forecasts[i].timeStamp.getUnix() <= currentEpoch)
+            currentIdx = i;
+    }
 
-  if (temp != nullptr)
-    free(temp);
+    if (currentIdx == forecastsCount) {
+        if (temp != nullptr && previousCount > 0 &&
+            previousCount <= forecastsCount) {
+            memcpy(forecasts, temp, sizeof(Forecast) * previousCount);
+            forecastsCount = previousCount;
+        }
+        if (temp != nullptr)
+            free(temp);
+        return;
+    }
+
+    if (currentIdx > 0) {
+        size_t newCount = forecastsCount - currentIdx;
+        for (size_t i = 0; i < newCount; i++) {
+            forecasts[i] = forecasts[i + currentIdx];
+        }
+        forecastsCount = newCount;
+    }
+
+    if (temp != nullptr)
+        free(temp);
 }
 
 void loadDebugForecasts() {
-  forecasts = (Forecast *)malloc(4 * sizeof(Forecast));
-  forecasts[0] = Forecast(SUN_01D, 23.2, 24.54, 30);
-  forecasts[1] = Forecast(MOON_02N, 15.2, 24.54, 30);
-  forecasts[2] = Forecast(CLOUDSUN_02D, 25.2, 24.54, 30);
-  forecasts[3] = Forecast(SHOWERRAIN_09, 23.2, 24.54, 30);
-  forecastsCount = 4;
+    forecasts = (Forecast *)malloc(4 * sizeof(Forecast));
+    forecasts[0] = Forecast(SUN_01D, 23.2, 24.54, 30);
+    forecasts[1] = Forecast(MOON_02N, 15.2, 24.54, 30);
+    forecasts[2] = Forecast(CLOUDSUN_02D, 25.2, 24.54, 30);
+    forecasts[3] = Forecast(SHOWERRAIN_09, 23.2, 24.54, 30);
+    forecastsCount = 4;
 }
 
 void loadForecasts() {
-  if (debug) {
-    loadDebugForecasts();
-  } else {
-    getForecast();
-  }
+    if (debug) {
+        loadDebugForecasts();
+    } else {
+        getForecast();
+    }
 }
 
 void updateForecast() {
-  static bool firstDraw = true;
+    static bool firstDraw = true;
 
-  if (forecasts == nullptr || forecastsCount == 0) {
-    loadForecasts();
-    currForecastIdx = 0;
-    firstDraw = true;
-  } else if (currForecastIdx >= (FORECAST_SLOTS - 1)) {
-    // aggiorno dati ogni 9 ore: 2 *
-    loadForecasts();
-    currForecastIdx = 0;
-    firstDraw = true;
-  }
+    if (forecasts == nullptr || forecastsCount == 0) {
+        loadForecasts();
+        currForecastIdx = 0;
+        firstDraw = true;
+    } else if (currForecastIdx >= (FORECAST_SLOTS - 1)) {
+        // aggiorno dati ogni 9 ore: 2 *
+        loadForecasts();
+        currForecastIdx = 0;
+        firstDraw = true;
+    }
 
-  if (forecasts == nullptr || forecastsCount == 0)
-    return;
+    if (forecasts == nullptr || forecastsCount == 0)
+        return;
 
-  const unsigned long now = timeClient.getEpochTime();
-  uint8_t newIdx = currForecastIdx;
-  while (newIdx + 1 < forecastsCount &&
-         now > forecasts[newIdx + 1].timeStamp.getUnix()) {
-    newIdx++;
-  }
+    time_t currentEpoch = nowEpoch;
+    uint8_t newIdx = currForecastIdx;
+    while (newIdx + 1 < forecastsCount &&
+           currentEpoch > forecasts[newIdx + 1].timeStamp.getUnix()) {
+        newIdx++;
+    }
 
-  if (firstDraw || newIdx != currForecastIdx) {
-    currForecastIdx = newIdx;
-    LOGF("updateForecast: %d, %d\n", now,
-         forecasts[currForecastIdx].timeStamp.getUnix());
-    drawHourForecast(currForecastIdx, forecastPoint);
-    firstDraw = false;
-  }
+    if (firstDraw || newIdx != currForecastIdx) {
+        currForecastIdx = newIdx;
+        LOGF("updateForecast: %lu, %lu\n", (unsigned long)currentEpoch,
+             forecasts[currForecastIdx].timeStamp.getUnix());
+        ui.drawForecast(forecasts, forecastsCount, currForecastIdx,
+                        forecastPoint, FORECAST_SLOTS);
+        firstDraw = false;
+    }
 }
 
 void setPoints() {
-  sensorPoint.x = 10;
-  sensorPoint.y = 15;
+    // Vertical rhythm: top sensors, centered CO2 row, forecast block with an
+    // even bottom margin.
+    sensorPoint.x = 10;
+    sensorPoint.y = 18;
 
-  extTermIgroPoint.x = 155;
-  extTermIgroPoint.y = 15;
+    extTermIgroPoint.x = 140;
+    extTermIgroPoint.y = 18;
 
-  forecastPoint.x = 22;
-  forecastPoint.y = 170;
+    forecastPoint.x = 20;
+    forecastPoint.y = 174;
 
-  pollutionPoint.x = 290;
-  pollutionPoint.y = 30;
+    pollutionPoint.x = 282;
+    pollutionPoint.y = 42;
 
-  co2ValuesPoint.x = 5;
-  co2ValuesPoint.y = 105;
+    co2ValuesPoint.x = 18;
+    co2ValuesPoint.y = 122;
 
-  timePoint.x = 310;
-  timePoint.y = 5;
+    timePoint.x = 300;
+    timePoint.y = 8;
 }
 
 void mqttCallback(char *topic, byte *payload, unsigned int length) {
-  JsonDocument doc;
-  DeserializationError err = deserializeJson(doc, payload, length);
-  if (err)
-    return;
-  extTermIgro.temp = doc["temp"].as<double>();
-  extTermIgro.humid = doc["umid"].as<uint8_t>();
-  extTermIgro.dt = timeClient.getEpochTime();
-  extAcquired = true;
-  drawTempAndHumidValues(extTermIgroPoint, extTermIgro.temp, extTermIgro.humid);
+    JsonDocument doc;
+    DeserializationError err = deserializeJson(doc, payload, length);
+    if (err)
+        return;
+    extTermIgro.temp = doc["temp"].as<double>();
+    extTermIgro.humid = doc["umid"].as<uint8_t>();
+    extTermIgro.dt = nowEpoch;
+    extAcquired = true;
+    ui.drawTempHumidity(extTermIgroPoint, extTermIgro.temp,
+                        extTermIgro.humid);
 }
 
 void updateTime() {
-  // aggiorno ogni 60 secondi
-  const unsigned long now = timeClient.getEpochTime();
-  if (now > nextScreenTimeUpdate) {
-    nextScreenTimeUpdate = now + 60;
-    char buffer[6];
-    sprintf(buffer, "%02d:%02d\n", timeClient.getHours(),
-            timeClient.getMinutes());
-    int16_t x1, y1;
-    uint16_t w, h;
-    display.setFont(nullptr);
-    display.setTextSize(2);
-    display.getTextBounds(buffer, timePoint.x, timePoint.y, &x1, &y1, &w, &h);
-    int16_t rectX = x1 - 1;
-    int16_t rectY = y1 - 1;
-    uint16_t rectW = w + 2;
-    uint16_t rectH = h + 2;
-    if (rectX < 0) {
-      rectW = rectW + rectX;
-      rectX = 0;
+    if (timeMgr.updateTime())
+        updateLoopClock();
+
+    if (intervalElapsed(lastScreenTimeUpdateMs, SCREEN_TIME_INTERVAL_MS)) {
+        struct tm timeinfo;
+        localtime_r(&nowEpoch, &timeinfo);
+
+        char buffer[6];
+        strftime(buffer, sizeof(buffer), "%H:%M", &timeinfo);
+
+        ui.drawClock(timePoint, buffer);
     }
-    if (rectY < 0) {
-      rectH = rectH + rectY;
-      rectY = 0;
-    }
-    display.setPartialWindow(rectX, rectY, rectW, rectH);
-    display.firstPage();
-    do {
-      display.fillRect(rectX, rectY, rectW, rectH, GxEPD_WHITE);
-      display.setCursor(timePoint.x, timePoint.y);
-      display.print(buffer);
-    } while (display.nextPage());
-  }
 }
 
 void setup() {
-  Serial.begin(115200);
-  Wire.begin();
-  airSensor.begin(Wire, true);
-  airSensor.setAltitudeCompensation(18);
-  sht.begin(Wire, SHT41_I2C_ADDR_44);
-  initDisplay();
-  drawCenteredStatus("Connessione in corso...");
-  wifiProvision.begin("Weather Display");
-  size_t nextOffset = 0;
-  // setup device salvato in precedenza
-  if (!setupMgr.begin()) {
-    LOG("DeviceSetupManager begin failed\n");
-    return;
-  }
+    Serial.begin(115200);
+    Wire.begin();
+    airSensor.begin(Wire, true);
+    airSensor.setAltitudeCompensation(18);
+    sht.begin(Wire, SHT41_I2C_ADDR_44);
+    ui.begin();
+    ui.drawCenteredStatus("Avvio in corso...");
+    wifiProvision.begin("Weather Display");
+    // setup device salvato in precedenza
+    if (!setupMgr.begin()) {
+        ui.drawCenteredStatus("Error starting device...");
+        LOG("DeviceSetupManager begin failed\n");
+        while (1) {
+            delay(1000);
+        }
+    }
 
-  drawCenteredStatus("Ricerca aggiornamento...");
-  if (setupMgr.isProvisioningReady()) {
-    devProps.begin(setupMgr.portalServerIp(), setupMgr.deviceId(),
-                           setupMgr.deviceSecret());
-    devProps.fetchAndStoreIfChanged();
-    simpleOTA.begin(setupMgr.portalServerIp(), setupMgr.deviceTypeId(),
-                    setupMgr.deviceId(), setupMgr.deviceSecret(), true);
-  }
+    timeMgr.ensureTimeSynced();
+    updateLoopClock();
+    if (setupMgr.isProvisioningReady()) {
+        devProps.begin(setupMgr.portalServerIp(), setupMgr.deviceId(),
+                       setupMgr.deviceSecret());
+        devProps.fetchAndStoreIfChanged();
+        simpleOTA.begin(setupMgr.portalServerIp(), setupMgr.deviceTypeId(),
+                        setupMgr.deviceId(), setupMgr.deviceSecret(), true);
+    }
 
-  timeClient.begin();
-  weather.reset(new WeatherAPI(devProps.Get("WEATHER_API_KEY"),
-                               devProps.Get("latitude"),
-                               devProps.Get("longitude")));
-  // sincronizzo ogni 60 minuti
-  timeClient.setUpdateInterval(36e5); // 60 minuti
+    weather.reset(new WeatherAPI(devProps.Get("WEATHER_API_KEY"),
+                                 devProps.Get("latitude"),
+                                 devProps.Get("longitude")));
 
-  if (mqttClient.begin(devProps.Get("MQTT_BROKER"),
-                        devProps.GetInt("MQTT_PORT", 8883),
-                        mqttCallback)) {
-    connectToMQTT();
-  } else {
-    LOG("MQTT manager init failed\n");
-  }
+    if (mqttClient.begin(devProps.Get("MQTT_BROKER"),
+                         devProps.GetInt("MQTT_PORT", MQTT_PORT),
+                         mqttCallback)) {
+        connectToMQTT();
+    } else {
+        LOG("MQTT manager init failed\n");
+    }
 
-  setPoints();
-  clearScreen();
-  drawStaticLayout();
+    setPoints();
+    ui.drawStaticLayout(sensorPoint, forecastPoint, pollutionPoint,
+                        extTermIgroPoint, co2ValuesPoint, FORECAST_SLOTS);
+    updateLoopClock();
+    lastSensorDisplayMs = nowMs;
 }
 
 void updateSensorValues() {
-  const unsigned long now = millis();
-  const unsigned long sensorIntervalMs = 20000;
-  if (now > nextSensorRequest && airSensor.dataAvailable()) {
-    nextSensorRequest = now + sensorIntervalMs;
-    float shtTemp, shtHum;
-    sht.measureHighPrecision(shtTemp, shtHum);
-    drawTempAndHumidValues(sensorPoint, shtTemp, (int)shtHum);
-    drawCo2Values(co2ValuesPoint, display.width() - (10 * 2), 18,
-                  airSensor.getCO2());
-  }
+    if (lastSensorSampleMs != 0 &&
+        nowMs - lastSensorSampleMs < SENSOR_SAMPLE_INTERVAL_MS) {
+        return;
+    }
+
+    if (airSensor.dataAvailable()) {
+        lastSensorSampleMs = nowMs;
+
+        float shtTemp, shtHum;
+        sht.measureHighPrecision(shtTemp, shtHum);
+        lastSensorTemp = shtTemp;
+        lastSensorHumid = shtHum;
+        sensorCo2Sum += airSensor.getCO2();
+        sensorSamples++;
+    }
+
+    if (sensorSamples == 0 ||
+        !intervalElapsed(lastSensorDisplayMs, SENSOR_DISPLAY_INTERVAL_MS)) {
+        return;
+    }
+
+    uint16_t avgCo2 = (uint16_t)((sensorCo2Sum + (sensorSamples / 2)) /
+                                 sensorSamples);
+    int16_t co2Delta = 0;
+    if (hasDisplayedCo2)
+        co2Delta = (int16_t)avgCo2 - (int16_t)lastDisplayedCo2;
+
+    ui.drawTempHumidity(sensorPoint, lastSensorTemp,
+                        (int)(lastSensorHumid + 0.5));
+    ui.drawCo2(co2ValuesPoint, ui.contentWidth(10), avgCo2, co2Delta,
+               hasDisplayedCo2);
+    lastDisplayedCo2 = avgCo2;
+    hasDisplayedCo2 = true;
+    resetSensorSamples();
 }
 
 void updateExternalTemperature() {
-  const unsigned long now = timeClient.getEpochTime();
-  // se oltre 20 minuti non ricevo nulla, azzero
-  if (extAcquired && now > extTermIgro.dt + 1200) { // 20 minuti
-    drawTempAndHumidValues(extTermIgroPoint, -200, -100);
-    extAcquired = false;
-  }
+    // se oltre 20 minuti non ricevo nulla, azzero
+    if (extAcquired && nowEpoch > extTermIgro.dt + EXT_SENSOR_TIMEOUT_SEC) {
+        ui.drawTempHumidity(extTermIgroPoint, -200, -100);
+        extAcquired = false;
+    }
 }
 
 void loop() {
-  simpleOTA.checkUpdates(86400); // 24 ore
+    updateLoopClock();
+    updateTime();
+    simpleOTA.checkUpdates(86400); // 24 ore
+    mqttClient.loop();
 
-  timeClient.update();
-  updateTime();
-  updateSensorValues();
-  updateAirPollution();
-  updateForecast();
-  if (!mqttClient.connected())
-    connectToMQTT();
-  mqttClient.loop();
-  updateExternalTemperature();
-  // display.hibernate();
+    updateSensorValues();
+    updateAirPollution();
+    updateForecast();
+    if (!mqttClient.connected())
+        connectToMQTT();
+    updateExternalTemperature();
+    ui.updatePowerState(nowMs, DISPLAY_POWER_OFF_IDLE_MS);
 }
