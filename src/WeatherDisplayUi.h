@@ -34,17 +34,20 @@ class WeatherDisplayUi {
                           DisplayPoint co2ValuesPoint,
                           uint8_t forecastSlots);
 
-    /// Updates the forecast area. Each column is refreshed as one block so its
-    /// icon, hour and values stay aligned and do not erase neighboring icons.
+    /// Updates the forecast area in a single partial refresh so all visible
+    /// columns change together.
     void drawForecast(Forecast *forecasts, size_t forecastsCount,
                       uint8_t startIndex, DisplayPoint point,
                       uint8_t forecastSlots);
+    void drawForecastStatus(DisplayPoint point, uint8_t forecastSlots,
+                            const char *text);
 
     void drawTempHumidity(DisplayPoint point, double temp, int humid,
                           bool showHumidity = true);
     void drawAirQuality(AirQuality *aqi, DisplayPoint point);
     void drawCo2(DisplayPoint point, uint16_t width, uint16_t co2,
                  int16_t deltaPpm, bool hasPreviousValue);
+    void drawCityName(const char *name);
     void drawClock(DisplayPoint point, const char *text);
 
     /// Powers the panel off after the last partial/full refresh has been idle
@@ -55,13 +58,24 @@ class WeatherDisplayUi {
 
   private:
     void markUpdated();
-    void drawText(const char *text, int16_t x, int16_t y, uint8_t textSize,
-                  uint16_t *retHeight = nullptr);
+    uint16_t textWidth(const char *text, const GFXfont *font,
+                       uint16_t *retHeight = nullptr);
+    uint16_t temperatureTextWidth(const char *text, const GFXfont *font);
+    void drawText(const char *text, int16_t x, int16_t y,
+                  const GFXfont *font, uint16_t *retHeight = nullptr);
+    void drawTemperatureText(const char *text, int16_t x, int16_t y,
+                             const GFXfont *font);
     void drawBitmapIcon(const uint8_t *image, size_t x, size_t y,
                         size_t iconSize = 64);
+    void drawCenteredTextInWindow(const char *text, int16_t windowX,
+                                  int16_t y, uint16_t windowW,
+                                  const GFXfont *font,
+                                  uint16_t *retHeight = nullptr);
+    void drawLayoutGuides(DisplayPoint sensorPoint, DisplayPoint forecastPoint,
+                          DisplayPoint pollutionPoint,
+                          DisplayPoint extTermIgroPoint,
+                          DisplayPoint co2ValuesPoint);
     void drawAirQualityLabels(DisplayPoint point);
-    void drawForecastContextIcons(int16_t x, int16_t y, uint8_t iconSize,
-                                  uint8_t spacing, uint8_t contextIconOffset);
 
     WeatherPanel &display;
     bool drawingStaticLayout = false;

@@ -70,26 +70,34 @@ Forecast * WeatherAPI::GetForecast(size_t maxRequest) {
         return NULL;
     }
 
+    const char *apiCityName = data["city"]["name"].as<const char *>();
+    if (apiCityName != nullptr)
+        cityName = apiCityName;
+
     size_t Cnt = data["cnt"].as<size_t>();
     Cnt = maxRequest < Cnt ? maxRequest : Cnt;
-    forecastsCount = Cnt;
-    //libero la memoria precedentemente utilizzata
-    if(this->forecsts != NULL)
-        free(this->forecsts);
-    //creo gli oggetti
-    this->forecsts = (Forecast *) malloc(sizeof(Forecast) * Cnt);
-    if (this->forecsts == NULL) {
+    Forecast *newForecasts = (Forecast *) malloc(sizeof(Forecast) * Cnt);
+    if (newForecasts == NULL) {
         forecastsCount = 0;
         return NULL;
     }
     for (size_t idx = 0; idx < Cnt; idx++ ){
-        forecsts[idx] = Forecast(data["list"][idx].as<JsonObject>());
+        newForecasts[idx] = Forecast(data["list"][idx].as<JsonObject>());
     }
+
+    forecastsCount = Cnt;
+    if(this->forecsts != NULL)
+        free(this->forecsts);
+    this->forecsts = newForecasts;
     return this->forecsts;
 }
 
 size_t WeatherAPI::GetForecastCount(){
     return forecastsCount;
+}
+
+const char * WeatherAPI::GetCityName() const {
+    return cityName.c_str();
 }
 
 AirQuality * WeatherAPI::GetAirPollution(){

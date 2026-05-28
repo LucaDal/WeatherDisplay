@@ -27,6 +27,7 @@ const unsigned long REFRESH_TIME_AQI_MS = 60UL * 60UL * 1000UL;
 const unsigned long SENSOR_SAMPLE_INTERVAL_MS = 10UL * 1000UL;
 const unsigned long SENSOR_DISPLAY_INTERVAL_MS = 60UL * 1000UL;
 const unsigned long SCREEN_TIME_INTERVAL_MS = 60UL * 1000UL;
+const unsigned long FORECAST_RETRY_INTERVAL_MS = 10UL * 60UL * 1000UL;
 // The e-paper panel is powered off shortly after each refresh. The framebuffer
 // content remains visible and the next partial refresh wakes the panel.
 const unsigned long DISPLAY_POWER_OFF_IDLE_MS = 10UL * 1000UL;
@@ -41,9 +42,8 @@ TimeSyncManager timeMgr;
 
 SCD30 airSensor;
 SensirionI2cSht4x sht;
-
-WeatherPanel display(GxEPD2_420_GDEY042T81(/*CS=5*/ SS, /*DC=*/3, /*RES=*/2,
-                                           /*BUSY=*/1)); // 400x300, SSD1683
+//in order: CS, DC, RES, BUSY
+WeatherPanel display(GxEPD2_420_GDEY042T81(SS, 3, 2, 1)); // 400x300, SSD1683
 WeatherDisplayUi ui(display);
 // API key, latitude and longitude
 std::unique_ptr<WeatherAPI> weather;
@@ -130,9 +130,10 @@ void updateAirPollution() {
 
 /// @brief uso questa funzione poiche'
 /// a volte, dopo il refresh, parte dalla previsione di 3 ore dopo
-void getForecast() {
+bool getForecast() {
     // min is 7, otherwise on update -> indexOutOfBounds
     const size_t maxSize = 8;
+    Forecast *previousForecasts = forecasts;
     size_t previousCount = forecastsCount;
     Forecast *temp = nullptr;
     if (forecasts != nullptr && previousCount > 0) {
@@ -140,13 +141,17 @@ void getForecast() {
         if (temp != nullptr)
             memcpy(temp, forecasts, sizeof(Forecast) * previousCount);
     }
-    forecasts = weather->GetForecast(maxSize);
-    forecastsCount = weather->GetForecastCount();
+    Forecast *newForecasts = weather->GetForecast(maxSize);
+    size_t newForecastsCount = weather->GetForecastCount();
+    forecasts = newForecasts;
+    forecastsCount = newForecastsCount;
     // primo avvio
     if (forecasts == nullptr || forecastsCount == 0) {
+        forecasts = previousForecasts;
+        forecastsCount = previousCount;
         if (temp != nullptr)
             free(temp);
-        return;
+        return false;
     }
     time_t currentEpoch = nowEpoch;
     size_t currentIdx = forecastsCount;
@@ -163,7 +168,7 @@ void getForecast() {
         }
         if (temp != nullptr)
             free(temp);
-        return;
+        return false;
     }
 
     if (currentIdx > 0) {
@@ -176,6 +181,7 @@ void getForecast() {
 
     if (temp != nullptr)
         free(temp);
+    return true;
 }
 
 void loadDebugForecasts() {
@@ -187,30 +193,73 @@ void loadDebugForecasts() {
     forecastsCount = 4;
 }
 
-void loadForecasts() {
+bool loadForecasts() {
     if (debug) {
         loadDebugForecasts();
+        return true;
     } else {
-        getForecast();
+        return getForecast();
     }
+}
+
+void updateCityName() {
+    static String lastCityName;
+    if (weather == nullptr)
+        return;
+
+    const char *cityName = weather->GetCityName();
+    if (cityName == nullptr || cityName[0] == '\0' || lastCityName == cityName)
+        return;
+
+    ui.drawCityName(cityName);
+    lastCityName = cityName;
 }
 
 void updateForecast() {
     static bool firstDraw = true;
+    static time_t lastReloadAttemptEpoch = 0;
+    static bool forecastStatusShown = false;
+    static bool lastReloadFailed = false;
+    static unsigned long lastForecastRetryMs = 0;
 
     if (forecasts == nullptr || forecastsCount == 0) {
-        loadForecasts();
-        currForecastIdx = 0;
-        firstDraw = true;
+        if (!lastReloadFailed ||
+            nowMs - lastForecastRetryMs >= FORECAST_RETRY_INTERVAL_MS) {
+            bool loaded = loadForecasts();
+            updateCityName();
+            currForecastIdx = 0;
+            firstDraw = true;
+            lastReloadFailed = !loaded;
+            lastForecastRetryMs = nowMs;
+        }
     } else if (currForecastIdx >= (FORECAST_SLOTS - 1)) {
-        // aggiorno dati ogni 9 ore: 2 *
-        loadForecasts();
-        currForecastIdx = 0;
-        firstDraw = true;
+        time_t reloadEpoch = forecasts[currForecastIdx].timeStamp.getUnix();
+        if (reloadEpoch != lastReloadAttemptEpoch ||
+            (lastReloadFailed &&
+             nowMs - lastForecastRetryMs >= FORECAST_RETRY_INTERVAL_MS)) {
+            // aggiorno dati ogni 9 ore: 3 slot da 3 ore
+            bool loaded = loadForecasts();
+            updateCityName();
+            if (loaded) {
+                currForecastIdx = 0;
+                firstDraw = true;
+                lastReloadFailed = false;
+            } else {
+                lastReloadFailed = true;
+            }
+            lastReloadAttemptEpoch = reloadEpoch;
+            lastForecastRetryMs = nowMs;
+        }
     }
 
-    if (forecasts == nullptr || forecastsCount == 0)
+    if (forecasts == nullptr || forecastsCount == 0) {
+        if (!forecastStatusShown) {
+            ui.drawForecastStatus(forecastPoint, FORECAST_SLOTS,
+                                  "connection missing");
+            forecastStatusShown = true;
+        }
         return;
+    }
 
     time_t currentEpoch = nowEpoch;
     uint8_t newIdx = currForecastIdx;
@@ -219,35 +268,48 @@ void updateForecast() {
         newIdx++;
     }
 
-    if (firstDraw || newIdx != currForecastIdx) {
+    if (lastReloadFailed && newIdx >= forecastsCount - 1 &&
+        currentEpoch > forecasts[newIdx].timeStamp.getUnix()) {
+        if (!forecastStatusShown) {
+            ui.drawForecastStatus(forecastPoint, FORECAST_SLOTS,
+                                  "connection missing");
+            forecastStatusShown = true;
+        }
+        currForecastIdx = newIdx;
+        firstDraw = false;
+        return;
+    }
+
+    bool shouldDraw = firstDraw || newIdx != currForecastIdx;
+    if (shouldDraw) {
         currForecastIdx = newIdx;
         LOGF("updateForecast: %lu, %lu\n", (unsigned long)currentEpoch,
              forecasts[currForecastIdx].timeStamp.getUnix());
         ui.drawForecast(forecasts, forecastsCount, currForecastIdx,
                         forecastPoint, FORECAST_SLOTS);
         firstDraw = false;
+        forecastStatusShown = false;
     }
 }
 
 void setPoints() {
-    // Vertical rhythm: top sensors, centered CO2 row, forecast block with an
-    // even bottom margin.
+    // Vertical rhythm: top sensors, forecast, then a bottom CO2 band.
     sensorPoint.x = 10;
-    sensorPoint.y = 18;
+    sensorPoint.y = 28;
 
     extTermIgroPoint.x = 140;
-    extTermIgroPoint.y = 18;
+    extTermIgroPoint.y = 28;
 
-    forecastPoint.x = 20;
-    forecastPoint.y = 174;
+    forecastPoint.x = 15;
+    forecastPoint.y = 130;
 
     pollutionPoint.x = 282;
-    pollutionPoint.y = 42;
+    pollutionPoint.y = 32;
 
     co2ValuesPoint.x = 18;
-    co2ValuesPoint.y = 122;
+    co2ValuesPoint.y = 244;
 
-    timePoint.x = 300;
+    timePoint.x = 272;
     timePoint.y = 8;
 }
 

@@ -12,6 +12,7 @@ class WeatherAPI {
         String API_KEY;
         String lat;
         String lon;
+        String cityName;
         WiFiClientSecure client;
         String server = "api.openweathermap.org";
         AirQuality * airQuality = NULL;
@@ -24,6 +25,7 @@ class WeatherAPI {
         //3hoursFor5Day
         Forecast * GetForecast(size_t maxRequest);
         size_t GetForecastCount();
+        const char * GetCityName() const;
         AirQuality * GetAirPollution();
 };
 
