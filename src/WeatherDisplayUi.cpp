@@ -287,20 +287,19 @@ void WeatherDisplayUi::drawForecast(Forecast *forecasts, size_t forecastsCount,
 
             const int textY = iconY + kForecastIconSize + kForecastSpacing;
             char tempBuffer[8];
-            char perceivedBuffer[8];
+            char humidityBuffer[8];
             snprintf(tempBuffer, sizeof(tempBuffer), "%d",
                      roundedForecastTemperature(forecasts[i].temp));
-            snprintf(perceivedBuffer, sizeof(perceivedBuffer), "%d",
-                     roundedForecastTemperature(forecasts[i].percivedTemp));
+            snprintf(humidityBuffer, sizeof(humidityBuffer), "%d%%",
+                     forecasts[i].humidity);
 
             const uint16_t tempW =
                 temperatureTextWidth(tempBuffer, kFontTiny);
-            const uint16_t perceivedW =
-                temperatureTextWidth(perceivedBuffer, kFontTiny);
+            const uint16_t humidityW = textWidth(humidityBuffer, kFontTiny);
             uint16_t rowW = 16 + kForecastSpacing + tempW;
-            const uint16_t perceivedRowW = 16 + kForecastSpacing + perceivedW;
-            if (perceivedRowW > rowW)
-                rowW = perceivedRowW;
+            const uint16_t humidityRowW = 16 + kForecastSpacing + humidityW;
+            if (humidityRowW > rowW)
+                rowW = humidityRowW;
 
             const int rowX =
                 iconX + (kForecastIconSize > rowW
@@ -311,12 +310,11 @@ void WeatherDisplayUi::drawForecast(Forecast *forecasts, size_t forecastsCount,
                 lineHeight > 16 ? (int16_t)((lineHeight - 16) / 2) : 0;
             drawBitmapIcon(THERMOMETER, rowX, textY + iconOffsetY, 16);
             drawTemperatureText(tempBuffer, valueX, textY, kFontTiny);
-            drawBitmapIcon(HUMAN, rowX,
+            drawBitmapIcon(HUMIDITY, rowX,
                            textY + lineHeight + kForecastSpacing + iconOffsetY,
                            16);
-            drawTemperatureText(perceivedBuffer, valueX,
-                                textY + lineHeight + kForecastSpacing,
-                                kFontTiny);
+            drawText(humidityBuffer, valueX,
+                     textY + lineHeight + kForecastSpacing, kFontTiny);
         }
     } while (display.nextPage());
 
