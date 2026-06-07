@@ -264,7 +264,10 @@ void WeatherDisplayUi::drawForecast(Forecast *forecasts, size_t forecastsCount,
 
     uint16_t lineHeight = 0;
     textWidth("00:00", kFontTiny, &lineHeight);
-    const int textBlockH = (lineHeight * 2) + kForecastSpacing;
+    const uint8_t metricIconSize = 16;
+    const uint16_t metricRowH =
+        lineHeight > metricIconSize ? lineHeight : metricIconSize;
+    const int textBlockH = (metricRowH * 2) + kForecastSpacing + 2;
     const uint16_t windowH =
         (iconY - windowTop) + kForecastIconSize + kForecastSpacing +
         textBlockH;
@@ -296,8 +299,9 @@ void WeatherDisplayUi::drawForecast(Forecast *forecasts, size_t forecastsCount,
             const uint16_t tempW =
                 temperatureTextWidth(tempBuffer, kFontTiny);
             const uint16_t humidityW = textWidth(humidityBuffer, kFontTiny);
-            uint16_t rowW = 16 + kForecastSpacing + tempW;
-            const uint16_t humidityRowW = 16 + kForecastSpacing + humidityW;
+            uint16_t rowW = metricIconSize + kForecastSpacing + tempW;
+            const uint16_t humidityRowW =
+                metricIconSize + kForecastSpacing + humidityW;
             if (humidityRowW > rowW)
                 rowW = humidityRowW;
 
@@ -305,16 +309,18 @@ void WeatherDisplayUi::drawForecast(Forecast *forecasts, size_t forecastsCount,
                 iconX + (kForecastIconSize > rowW
                              ? (int)((kForecastIconSize - rowW) / 2)
                              : 0);
-            const int valueX = rowX + 16 + kForecastSpacing;
+            const int valueX = rowX + metricIconSize + kForecastSpacing;
             const int16_t iconOffsetY =
-                lineHeight > 16 ? (int16_t)((lineHeight - 16) / 2) : 0;
-            drawBitmapIcon(THERMOMETER, rowX, textY + iconOffsetY, 16);
+                metricRowH > metricIconSize
+                    ? (int16_t)((metricRowH - metricIconSize) / 2)
+                    : 0;
+            const int humidityY = textY + metricRowH + kForecastSpacing;
+            drawBitmapIcon(THERMOMETER, rowX, textY + iconOffsetY,
+                           metricIconSize);
             drawTemperatureText(tempBuffer, valueX, textY, kFontTiny);
-            drawBitmapIcon(HUMIDITY, rowX,
-                           textY + lineHeight + kForecastSpacing + iconOffsetY,
-                           16);
-            drawText(humidityBuffer, valueX,
-                     textY + lineHeight + kForecastSpacing, kFontTiny);
+            drawBitmapIcon(HUMIDITY, rowX, humidityY + iconOffsetY,
+                           metricIconSize);
+            drawText(humidityBuffer, valueX, humidityY, kFontTiny);
         }
     } while (display.nextPage());
 
